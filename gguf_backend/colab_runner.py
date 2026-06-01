@@ -1,9 +1,11 @@
 import os
 from pathlib import Path
+
 from .installer import ensure_apt_tools, install_llama_cpp_prebuilt
 from .downloader import download_model_pair
 from .server import ServerConfig, start_server
 from .tunnel import start_tunnels
+
 
 def run_colab(
     *,
@@ -31,9 +33,18 @@ def run_colab(
 ):
     root = Path("/content")
     model_dir = root / "models" / "current"
+
     ensure_apt_tools()
     install_llama_cpp_prebuilt(root, cuda_preference=cuda_preference)
-    cfg = download_model_pair(model_url, mmproj_url, model_dir, hf_token=hf_token or os.environ.get("HF_TOKEN", ""), connections=16)
+
+    cfg = download_model_pair(
+        model_url,
+        mmproj_url,
+        model_dir,
+        hf_token=hf_token or os.environ.get("HF_TOKEN", ""),
+        connections=16,
+    )
+
     server_cfg = ServerConfig(
         root_dir=str(root),
         model_path=cfg["model_path"],
@@ -56,6 +67,15 @@ def run_colab(
         mmproj_offload=mmproj_offload,
         cuda_visible_devices="0",
     )
+
     server_info = start_server(server_cfg, warmup=True)
-    urls = start_tunnels(port, str(root), mode=tunnel_mode, ngrok_token=ngrok_authtoken, fallback_cloudflare=True)
+
+    urls = start_tunnels(
+        port,
+        str(root),
+        mode=tunnel_mode,
+        ngrok_token=ngrok_authtoken,
+        fallback_cloudflare=True,
+    )
+
     return {"server": server_info, "tunnels": urls}
