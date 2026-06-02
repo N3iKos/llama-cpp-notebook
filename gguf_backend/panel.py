@@ -1,14 +1,20 @@
 """Notebook-first realtime output panels for Kaggle/Colab.
 
-All command output is captured to log files. The notebook only receives a
-compact dashboard + terminal tail rendered with ipywidgets. During execution the
-terminal auto-scrolls to the bottom; when the process finishes auto-scroll is
-stopped so users can scroll upward and inspect the visible log.
+All command output is captured to log files. The notebook receives a compact
+structured dashboard plus a terminal-like log viewer.
+
+The terminal renderer intentionally keeps one persistent DOM container and
+appends log lines incrementally through JavaScript. This avoids the old behavior
+where the whole HTML block was replaced, briefly jumping to the top before being
+forced back to the bottom. While a process is running, follow-bottom is enabled
+by default. If the user scrolls up, follow-bottom pauses. After the process
+finishes, follow-bottom is disabled so users can inspect older visible logs.
 """
 
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import select
@@ -100,6 +106,7 @@ class NotebookPanel:
         self.lines: list[str] = []
         self.term_id = "cli_term_" + uuid.uuid4().hex
         self.copy_ns = "copy_ns_" + uuid.uuid4().hex
+        self.js_api = "__smooth_cli_" + self.term_id
         self._displayed = False
         self._widgets_ok = False
         self._autoscroll = False
@@ -116,8 +123,12 @@ class NotebookPanel:
             self.title = widgets.HTML(value=self._title_html(self.title_text))
             self.status = widgets.HTML(value=self._status_html("idle"))
             self.progress = widgets.FloatProgress(
-                value=0, min=0, max=100, description="0%", bar_style="",
-                layout=widgets.Layout(width="100%")
+                value=0,
+                min=0,
+                max=100,
+                description="0%",
+                bar_style="",
+                layout=widgets.Layout(width="100%"),
             )
             self.progress_info = widgets.HTML(value=self._progress_info_html("-"))
             self.progress_box = widgets.VBox(
@@ -130,7 +141,7 @@ class NotebookPanel:
             )
             self.dashboard = widgets.HTML(value=self._dashboard_html(""))
             self.dashboard.layout.display = "none"
-            self.terminal = widgets.HTML(value=self._terminal_html("terminal ready"))
+            self.terminal = widgets.HTML(value=self._terminal_shell_html())
             self.footer = widgets.HTML(value=self._footer_html("log: -"))
             self.ui = widgets.VBox([self.title, self.status, self.progress_box, self.dashboard, self.terminal, self.footer])
             self._widgets_ok = True
@@ -145,40 +156,159 @@ class NotebookPanel:
             print(self.title_text)
             return self
         self.display(self.ui)
-        self.start_autoscroll()
+        self._init_terminal_js()
         return self
+
+    def _js_call(self, method: str, *args):
+        if not self._widgets_ok or not self._displayed:
+            return
+        payload = ", ".join(json.dumps(arg) for arg in args)
+        api_name = json.dumps(self.js_api)
+        method_name = json.dumps(method)
+        self.display(self.Javascript(f"""
+(function callSmoothCli() {{
+  const api = window[{api_name}];
+  if (!api || !api[{method_name}]) {{
+    setTimeout(callSmoothCli, 60);
+    return;
+  }}
+  api[{method_name}]({payload});
+}})();
+"""))
+
+    def _init_terminal_js(self):
+        if not self._widgets_ok:
+            return
+        self._autoscroll = True
+        term_id = json.dumps(self.term_id)
+        api_name = json.dumps(self.js_api)
+        max_lines = int(self.max_lines)
+        self.display(self.Javascript(f"""
+(function initSmoothCli() {{
+  const id = {term_id};
+  const apiName = {api_name};
+  const term = document.getElementById(id);
+  const linesEl = document.getElementById(id + "_lines");
+  const currentEl = document.getElementById(id + "_current");
+  const followBtn = document.getElementById(id + "_follow_btn");
+  const clearBtn = document.getElementById(id + "_clear_btn");
+  const marker = document.getElementById(id + "_marker");
+
+  if (!term || !linesEl || !currentEl) {{
+    setTimeout(initSmoothCli, 80);
+    return;
+  }}
+
+  const model = {{
+    follow: true,
+    running: true,
+    maxLines: {max_lines},
+    pending: [],
+    scheduled: false
+  }};
+
+  function nearBottom() {{
+    return (term.scrollHeight - term.scrollTop - term.clientHeight) < 48;
+  }}
+
+  function setFollow(value) {{
+    model.follow = !!value;
+    if (followBtn) followBtn.textContent = "Follow: " + (model.follow ? "on" : "off");
+    if (marker) marker.textContent = model.follow ? "following latest log" : "manual scroll";
+  }}
+
+  function prune() {{
+    while (linesEl.childNodes.length > model.maxLines) {{
+      linesEl.removeChild(linesEl.firstChild);
+    }}
+  }}
+
+  function flush() {{
+    model.scheduled = false;
+    if (model.pending.length) {{
+      const frag = document.createDocumentFragment();
+      for (const line of model.pending) {{
+        const div = document.createElement("div");
+        div.textContent = String(line);
+        frag.appendChild(div);
+      }}
+      model.pending = [];
+      linesEl.appendChild(frag);
+      prune();
+    }}
+    if (model.follow) {{
+      term.scrollTop = term.scrollHeight;
+    }}
+  }}
+
+  term.addEventListener("scroll", function() {{
+    if (!model.running) return;
+    if (!nearBottom()) setFollow(false);
+  }});
+
+  if (followBtn) {{
+    followBtn.onclick = function() {{
+      setFollow(true);
+      requestAnimationFrame(function() {{ term.scrollTop = term.scrollHeight; }});
+    }};
+  }}
+
+  if (clearBtn) {{
+    clearBtn.onclick = function() {{
+      linesEl.textContent = "";
+      currentEl.textContent = "";
+    }};
+  }}
+
+  window[apiName] = {{
+    append: function(lines) {{
+      if (!Array.isArray(lines)) lines = [String(lines)];
+      for (const line of lines) model.pending.push(String(line));
+      if (!model.scheduled) {{
+        model.scheduled = true;
+        requestAnimationFrame(flush);
+      }}
+    }},
+    current: function(text) {{
+      currentEl.textContent = text ? String(text) : "";
+      if (model.follow) requestAnimationFrame(function() {{ term.scrollTop = term.scrollHeight; }});
+    }},
+    setText: function(lines) {{
+      if (!Array.isArray(lines)) lines = String(lines).split("\\n");
+      linesEl.textContent = "";
+      currentEl.textContent = "";
+      const frag = document.createDocumentFragment();
+      for (const line of lines.slice(-model.maxLines)) {{
+        const div = document.createElement("div");
+        div.textContent = String(line);
+        frag.appendChild(div);
+      }}
+      linesEl.appendChild(frag);
+      if (model.follow) requestAnimationFrame(function() {{ term.scrollTop = term.scrollHeight; }});
+    }},
+    follow: function(value) {{
+      setFollow(value);
+      if (value) requestAnimationFrame(function() {{ term.scrollTop = term.scrollHeight; }});
+    }},
+    done: function() {{
+      model.running = false;
+      setFollow(false);
+      requestAnimationFrame(function() {{ term.scrollTop = term.scrollHeight; }});
+    }}
+  }};
+
+  setFollow(true);
+  window[apiName].setText(["terminal ready"]);
+}})();
+"""))
 
     def start_autoscroll(self):
         self._autoscroll = True
-        if not self._widgets_ok:
-            return
-        self.display(self.Javascript(f"""
-(function() {{
-  const termId = "{self.term_id}";
-  const key = "__autoscr_" + termId;
-  if (window[key]) {{ clearInterval(window[key]); }}
-  window[key] = setInterval(function() {{
-    const el = document.getElementById(termId);
-    if (el) {{ el.scrollTop = el.scrollHeight; }}
-  }}, 120);
-}})();
-"""))
+        self._js_call("follow", True)
 
     def stop_autoscroll(self):
         self._autoscroll = False
-        if not self._widgets_ok:
-            return
-        self.display(self.Javascript(f"""
-(function() {{
-  const termId = "{self.term_id}";
-  const key = "__autoscr_" + termId;
-  const el = document.getElementById(termId);
-  if (el) {{ el.scrollTop = el.scrollHeight; }}
-  setTimeout(function() {{
-    if (window[key]) {{ clearInterval(window[key]); window[key] = null; }}
-  }}, 250);
-}})();
-"""))
+        self._js_call("done")
 
     def _title_html(self, text):
         return f'<div style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:15px;font-weight:700;padding:8px 10px;border:1px solid #333;border-bottom:0;background:#111;color:#f5f5f5;">{esc(text)}</div>'
@@ -194,8 +324,24 @@ class NotebookPanel:
             return '<div></div>'
         return f'<div style="border-left:1px solid #333;border-right:1px solid #333;background:#0b0b0b;color:#e8e8e8;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.35;padding:10px;">{body}</div>'
 
+    def _terminal_shell_html(self):
+        return f'''<div style="border:1px solid #333;background:#050505;color:#e8e8e8;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.35;">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 10px;background:#101010;border-bottom:1px solid #333;color:#bbb;">
+    <div id="{self.term_id}_marker">following latest log</div>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <button id="{self.term_id}_follow_btn" style="background:#222;color:#eee;border:1px solid #555;border-radius:14px;padding:4px 9px;cursor:pointer;font-family:inherit;font-size:12px;">Follow: on</button>
+      <button id="{self.term_id}_clear_btn" style="background:#222;color:#eee;border:1px solid #555;border-radius:14px;padding:4px 9px;cursor:pointer;font-family:inherit;font-size:12px;">Clear view</button>
+    </div>
+  </div>
+  <div id="{self.term_id}" style="height:{self.height}px;overflow-y:auto;padding:10px;white-space:pre-wrap;word-break:break-word;background:#050505;color:#e8e8e8;scroll-behavior:auto;">
+    <div id="{self.term_id}_lines"></div>
+    <div id="{self.term_id}_current"></div>
+  </div>
+</div>'''
+
     def _terminal_html(self, body):
-        return f'<div id="{self.term_id}" style="margin:0;padding:10px;height:{self.height}px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;background:#050505;color:#e8e8e8;border:1px solid #333;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.35;">{esc(body)}</div>'
+        # Compatibility shim: normal runtime no longer replaces terminal HTML.
+        return self._terminal_shell_html()
 
     def _footer_html(self, text):
         return f'<div style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;padding:7px 10px;border:1px solid #333;border-top:0;background:#111;color:#aaa;">{esc(text)}</div>'
@@ -249,15 +395,7 @@ class NotebookPanel:
         self.set_dashboard(body)
 
     def set_links(self, title: str, links: dict[str, str], *, note: str = ""):
-        """Render endpoint rows.
-
-        links values may be either:
-          - "https://..."
-          - {"url": "https://...", "copy": True, "open": True}
-
-        Base/playground URLs should pass open=True so users can launch the
-        llama.cpp playground directly. API endpoints usually only need copy.
-        """
+        """Render endpoint rows with open/copy actions."""
         cards = [f'<div style="font-weight:700;margin-bottom:8px;">{esc(title)}</div>']
         bindings = []
         if note:
@@ -277,7 +415,6 @@ class NotebookPanel:
             btn_id = f"btn_{uuid.uuid4().hex}"
             input_id = f"inp_{uuid.uuid4().hex}"
             safe_url_attr = html.escape(url, quote=True)
-            safe_url_text = esc(url)
 
             actions = []
             if can_open:
@@ -306,8 +443,8 @@ class NotebookPanel:
             for btn_id, input_id in bindings:
                 self.display(self.Javascript(f"""
 (function attachCopyButton() {{
-  const btn = document.getElementById(\"{btn_id}\");
-  const inp = document.getElementById(\"{input_id}\");
+  const btn = document.getElementById({json.dumps(btn_id)});
+  const inp = document.getElementById({json.dumps(input_id)});
   if (!btn || !inp) {{ setTimeout(attachCopyButton, 100); return; }}
   btn.onclick = function() {{
     inp.select();
@@ -332,18 +469,24 @@ class NotebookPanel:
 
     def append(self, line: str, *, max_lines=None):
         if line:
-            self.lines.append(str(line))
+            line = str(line)
+            self.lines.append(line)
             self.lines = self.lines[-(max_lines or self.max_lines):]
+            if self._widgets_ok and self._displayed:
+                self._js_call("append", [line])
 
     def set_lines(self, lines: Iterable[str]):
         self.lines = [str(x) for x in lines][-self.max_lines:]
+        if self._widgets_ok and self._displayed:
+            self._js_call("setText", self.lines)
 
     def render(self, current=""):
-        body = "\n".join(self.lines[-self.max_lines:])
-        if current and current.strip():
-            body = body + ("\n" if body else "") + current.strip()
-        if self._widgets_ok:
-            self.terminal.value = self._terminal_html(body)
+        # Smooth terminal mode: do not replace terminal HTML. Updating only the
+        # partial/current line keeps the DOM stable and avoids jumpy scrolling.
+        if self._widgets_ok and self._displayed:
+            self._js_call("current", current.strip() if current else "")
+        elif current:
+            print(current)
 
     def finish(self, ok=True, message="completed"):
         self.set_status(message)
@@ -359,25 +502,56 @@ class SilentPanel:
     def __init__(self):
         self.lines = []
         self.show_progress = False
-    def display_panel(self): return self
-    def start_autoscroll(self): pass
-    def stop_autoscroll(self): pass
-    def set_footer(self, text): pass
-    def set_status(self, text): pass
-    def set_title(self, text): pass
-    def set_progress_visible(self, visible): self.show_progress = visible
-    def set_progress(self, pct, info="", style="info"): pass
-    def set_dashboard(self, html_body): pass
-    def set_summary(self, title, lines=None, data=None): pass
-    def set_links(self, title, links, note=""): pass
-    def section(self, text): self.append(text)
+
+    def display_panel(self):
+        return self
+
+    def start_autoscroll(self):
+        pass
+
+    def stop_autoscroll(self):
+        pass
+
+    def set_footer(self, text):
+        pass
+
+    def set_status(self, text):
+        pass
+
+    def set_title(self, text):
+        pass
+
+    def set_progress_visible(self, visible):
+        self.show_progress = visible
+
+    def set_progress(self, pct, info="", style="info"):
+        pass
+
+    def set_dashboard(self, html_body):
+        pass
+
+    def set_summary(self, title, lines=None, data=None):
+        pass
+
+    def set_links(self, title, links, note=""):
+        pass
+
+    def section(self, text):
+        self.append(text)
+
     def append(self, line, *, max_lines=None):
         if line:
             self.lines.append(str(line))
             self.lines = self.lines[-(max_lines or 500):]
-    def set_lines(self, lines): self.lines = list(lines)
-    def render(self, current=""): pass
-    def finish(self, ok=True, message="completed"): pass
+
+    def set_lines(self, lines):
+        self.lines = list(lines)
+
+    def render(self, current=""):
+        pass
+
+    def finish(self, ok=True, message="completed"):
+        pass
 
 
 def parse_aria2_progress(line: str):
@@ -447,7 +621,6 @@ def run_command(
     safe_label = _safe_filename(label)
     log_path = Path(log_dir) / (log_name or f"{int(time.time())}_{safe_label}.log")
 
-    own_panel = panel is None
     if panel is None:
         panel = NotebookPanel(label, show_progress=(mode == "download")) if show else SilentPanel()
         if show:
@@ -455,6 +628,7 @@ def run_command(
     else:
         panel.display_panel()
 
+    panel.start_autoscroll()
     panel.set_progress_visible(mode == "download")
     panel.set_footer(f"log: {log_path}")
     panel.set_status("starting download..." if mode == "download" else f"running: {label}")
@@ -613,8 +787,7 @@ def show_summary(title: str, data=None, *, lines: Optional[Iterable[str]] = None
         panel.set_footer(f"log: {log_path}")
     panel.set_summary(title, lines=lines)
     if own_panel:
-        for line in lines:
-            panel.append(str(line))
+        panel.set_lines([str(line) for line in lines])
         panel.render()
         if finalize:
             panel.finish(True, "summary")
