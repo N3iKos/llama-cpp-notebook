@@ -8,8 +8,7 @@ from pathlib import Path
 
 from .client import chat, get_json
 from .installer import read_env_file
-from .ui import tail_text
-from .panel import NotebookPanel, show_summary
+from .panel import NotebookPanel, show_summary, tail_text
 
 
 @dataclass
@@ -156,19 +155,26 @@ def start_once(cfg: ServerConfig, env, server, help_text):
     return proc, cmd, log_path
 
 
-def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240):
+def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240, panel=None):
     base = f"http://127.0.0.1:{cfg.port}"
     start = time.time()
     last = 0.0
-    panel = NotebookPanel("llama-server", show_progress=False, height=330)
+    own_panel = panel is None
+    if panel is None:
+        panel = NotebookPanel("llama-server", show_progress=False, height=330)
     panel.display_panel()
+    panel.set_progress_visible(False)
     panel.set_footer(f"log: {log_path}")
 
     while time.time() - start < timeout:
         elapsed = int(time.time() - start)
         if proc.poll() is not None:
             panel.lines = ["llama-server exited during startup", "", *tail_text(log_path, 120).splitlines()]
-            panel.finish(False, f"server exited | elapsed {elapsed}s")
+            if own_panel:
+                panel.finish(False, f"server exited | elapsed {elapsed}s")
+            else:
+                panel.set_status(f"server exited | elapsed {elapsed}s")
+                panel.render()
             return False
 
         if port_is_open("127.0.0.1", cfg.port):
@@ -182,7 +188,11 @@ def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240):
                         "",
                         *tail_text(log_path, 20).splitlines(),
                     ]
-                    panel.finish(True, "llama-server ready")
+                    if own_panel:
+                        panel.finish(True, "llama-server ready")
+                    else:
+                        panel.set_status("llama-server ready")
+                        panel.render()
                     return True
             except Exception:
                 pass
@@ -196,10 +206,14 @@ def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240):
         time.sleep(0.5)
 
     panel.lines = ["llama-server startup timeout", "", *tail_text(log_path, 120).splitlines()]
-    panel.finish(False, f"startup timeout after {timeout}s")
+    if own_panel:
+        panel.finish(False, f"startup timeout after {timeout}s")
+    else:
+        panel.set_status(f"startup timeout after {timeout}s")
+        panel.render()
     return False
 
-def start_server(cfg: ServerConfig, *, warmup=True):
+def start_server(cfg: ServerConfig, *, warmup=True, panel=None):
     root = Path(cfg.root_dir)
     env = read_env_file(root / "llama_env.sh")
 
@@ -218,13 +232,13 @@ def start_server(cfg: ServerConfig, *, warmup=True):
     stop_server(cfg.root_dir)
 
     proc, cmd, log_path = start_once(cfg, env, server, help_text)
-    ok = wait_ready(proc, cfg, log_path)
+    ok = wait_ready(proc, cfg, log_path, panel=panel)
 
     if not ok and cfg.fallback_split_mode and cfg.fallback_split_mode != cfg.split_mode:
         kill_pid(proc.pid)
         cfg.split_mode = cfg.fallback_split_mode
         proc, cmd, log_path = start_once(cfg, env, server, help_text)
-        ok = wait_ready(proc, cfg, log_path)
+        ok = wait_ready(proc, cfg, log_path, panel=panel)
 
     if not ok:
         raise RuntimeError("llama-server failed to start.")
@@ -232,18 +246,24 @@ def start_server(cfg: ServerConfig, *, warmup=True):
     base = f"http://127.0.0.1:{cfg.port}"
 
     if warmup:
+        if panel:
+            panel.section("warmup")
+            panel.set_status("warmup request...")
         chat(base, cfg.alias, "ping", max_tokens=16)
+        if panel:
+            panel.append("warmup: ok")
+            panel.render()
 
-    show_summary(
-        "llama-server ready",
-        lines=[
-            f"local: {base}/v1/chat/completions",
-            f"model: {cfg.alias}",
-            f"pid: {proc.pid}",
-            f"log: {log_path}",
-        ],
-        log_path=log_path,
-    )
+    ready_lines = [
+        f"local: {base}/v1/chat/completions",
+        f"model: {cfg.alias}",
+        f"pid: {proc.pid}",
+        f"log: {log_path}",
+    ]
+    if panel:
+        panel.set_summary("llama-server ready", lines=ready_lines)
+    else:
+        show_summary("llama-server ready", lines=ready_lines, log_path=log_path)
 
     return {
         "base_url": base,
