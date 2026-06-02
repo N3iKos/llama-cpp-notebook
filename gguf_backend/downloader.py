@@ -37,7 +37,7 @@ def _size_gib(num):
     return f"{num / 1024**3:.2f} GiB"
 
 
-def download_with_aria_live(url, out_dir, out_name=None, *, token="", connections=16, clear=True):
+def download_with_aria_live(url, out_dir, out_name=None, *, token="", connections=16, clear=True, panel=None):
     if not url:
         return ""
 
@@ -52,10 +52,13 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
     remote_size = get_remote_size(url, token=token)
 
     if remote_size and local_size(out_path) >= remote_size:
-        show_summary(
-            "Download skipped",
-            lines=[f"file: {out_path}", f"size: {_size_gib(local_size(out_path))}", "state: already complete"],
-        )
+        lines = [f"file: {out_path}", f"size: {_size_gib(local_size(out_path))}", "state: already complete"]
+        if panel:
+            panel.append(f"download skipped: {out_path}")
+            panel.set_summary("download skipped", lines=lines)
+            panel.render()
+        else:
+            show_summary("download skipped", lines=lines)
         return str(out_path)
 
     headers = []
@@ -76,30 +79,39 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
         mode="download",
         check=True,
         log_name=f"download_{Path(out_name).name}.log".replace("/", "_"),
-        tail_lines=120,
+        tail_lines=160,
         refresh_interval=0.10,
         hide_redirects=True,
+        panel=panel,
+        finalize=False if panel else True,
     )
 
     final_size = local_size(out_path)
     if final_size <= 0:
         raise RuntimeError(f"Downloaded file is empty: {out_path}")
 
-    show_summary(
-        "Download result",
-        lines=[f"file: {out_path}", f"size: {_size_gib(final_size)}", "state: complete"],
-        log_path=getattr(result, "log_path", None),
-    )
+    lines = [f"file: {out_path}", f"size: {_size_gib(final_size)}", "state: complete"]
+    if panel:
+        panel.set_summary("download result", lines=lines)
+        panel.append(f"download complete: {out_path}")
+        panel.render()
+    else:
+        show_summary("download result", lines=lines, log_path=getattr(result, "log_path", None))
     return str(out_path)
 
 
-def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connections=16):
+def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connections=16, panel=None):
     model_dir = Path(model_dir)
-    model_path = download_with_aria_live(model_url, model_dir, token=hf_token, connections=connections)
+
+    if panel:
+        panel.section("download model")
+    model_path = download_with_aria_live(model_url, model_dir, token=hf_token, connections=connections, panel=panel)
 
     mmproj_path = ""
     if mmproj_url:
-        mmproj_path = download_with_aria_live(mmproj_url, model_dir, token=hf_token, connections=connections)
+        if panel:
+            panel.section("download mmproj")
+        mmproj_path = download_with_aria_live(mmproj_url, model_dir, token=hf_token, connections=connections, panel=panel)
 
     cfg = {
         "model_path": model_path,
@@ -117,5 +129,11 @@ def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connec
         cfg_path = model_dir / "model_config.json"
 
     cfg_path.write_text(json.dumps(cfg, indent=2))
-    show_summary("Model config", lines=[f"model_path: {model_path}", f"mmproj_path: {mmproj_path or '-'}", f"config: {cfg_path}"])
+    cfg["config_path"] = str(cfg_path)
+
+    if panel:
+        panel.set_summary("model config", data=cfg)
+        panel.render()
+    else:
+        show_summary("model config", cfg)
     return cfg

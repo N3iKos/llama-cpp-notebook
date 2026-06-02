@@ -1,12 +1,13 @@
 import re
-import subprocess
 
 from .panel import run_command
 
 CLOUDFLARE_URL_RE = re.compile(r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com")
 
 
-def run(cmd, *, timeout=None, env=None, check=False, cwd=None, quiet=False, label=None):
+def run(cmd, *, timeout=None, env=None, check=False, cwd=None, quiet=False, label=None, panel=None, finalize=None):
+    if finalize is None:
+        finalize = panel is None
     return run_command(
         cmd,
         label=label or "command",
@@ -16,10 +17,14 @@ def run(cmd, *, timeout=None, env=None, check=False, cwd=None, quiet=False, labe
         check=check,
         mode="terminal",
         show=not quiet,
+        panel=panel,
+        finalize=finalize,
     )
 
 
-def run_live(cmd, *, label="process", env=None, cwd=None, timeout=None, clear=True, keep_last=25):
+def run_live(cmd, *, label="process", env=None, cwd=None, timeout=None, clear=True, keep_last=25, panel=None, finalize=None):
+    if finalize is None:
+        finalize = panel is None
     result = run_command(
         cmd,
         label=label,
@@ -28,8 +33,10 @@ def run_live(cmd, *, label="process", env=None, cwd=None, timeout=None, clear=Tr
         timeout=timeout,
         check=True,
         mode="download" if _looks_like_downloader(cmd) else "terminal",
-        tail_lines=max(keep_last, 80),
+        tail_lines=max(keep_last, 100),
         show=True,
+        panel=panel,
+        finalize=finalize,
     )
     return result.stdout
 
