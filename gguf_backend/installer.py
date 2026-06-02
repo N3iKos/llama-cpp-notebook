@@ -7,7 +7,8 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-from .shell import run_live
+from .shell import run, run_live
+from .panel import show_summary
 
 GITHUB_API_LLAMA_CUDA = "https://api.github.com/repos/ai-dock/llama.cpp-cuda/releases/latest"
 CLOUDFLARED_AMD64 = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -18,11 +19,7 @@ def ensure_apt_tools():
     packages = ["aria2", "curl", "wget", "tar", "unzip"]
     missing = [p for p in packages if shutil.which(p) is None]
     if missing:
-        run_live(
-            "apt-get update -qq && apt-get install -y -qq " + " ".join(missing),
-            label="install apt tools",
-            log_path="/tmp/llama_cpp_notebook_apt_tools.log",
-        )
+        run("apt-get update -qq && apt-get install -y -qq " + " ".join(missing), check=True)
 
 
 def arch_name():
@@ -60,12 +57,18 @@ def latest_llama_cuda_asset(cuda_preference="12.8"):
 
 
 def save_env(env_path, llama_dir, bin_dir, server):
+    llama_dir = Path(llama_dir)
+    bin_dir = Path(bin_dir)
+    # Some prebuilt archives keep dependent .so files outside the binary folder.
+    # Include every extracted shared-library directory to avoid runtime linker errors.
+    so_dirs = sorted({str(p.parent) for p in llama_dir.rglob("*.so*")})
+    lib_path = ":".join([str(bin_dir), *so_dirs, "$LD_LIBRARY_PATH"])
     Path(env_path).write_text(
         f'export LLAMA_CPP_DIR="{llama_dir}"\n'
         f'export LLAMA_BIN_DIR="{bin_dir}"\n'
         f'export LLAMA_SERVER="{server}"\n'
         f'export PATH="{bin_dir}:$PATH"\n'
-        f'export LD_LIBRARY_PATH="{bin_dir}:$LD_LIBRARY_PATH"\n'
+        f'export LD_LIBRARY_PATH="{lib_path}"\n'
     )
 
 
@@ -82,7 +85,9 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
             bin_dir = server.parent
             env_path = root_dir / "llama_env.sh"
             save_env(env_path, llama_dir, bin_dir, server)
-            return {"llama_dir": str(llama_dir), "bin_dir": str(bin_dir), "server": str(server), "skipped": True}
+            info = {"llama_dir": str(llama_dir), "bin_dir": str(bin_dir), "server": str(server), "skipped": True}
+            show_summary("llama.cpp prebuilt", info)
+            return info
 
     rel, asset = latest_llama_cuda_asset(cuda_preference=cuda_preference)
     url = asset["browser_download_url"]
@@ -93,10 +98,11 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
     run_live(
         [
             "aria2c", "-c", "-x", "8", "-s", "8", "-k", "1M",
-            "--summary-interval=1", "-d", str(dl_dir), "-o", name, url,
+            "--summary-interval=1", "--console-log-level=warn", "--show-console-readout=true",
+            "--allow-overwrite=true", "--auto-file-renaming=false",
+            "-d", str(dl_dir), "-o", name, url,
         ],
         label=f"download llama.cpp prebuilt: {name}",
-        log_path=dl_dir / f"{name}.download.log",
     )
 
     if llama_dir.exists():
@@ -122,7 +128,7 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
     env_path = root_dir / "llama_env.sh"
     save_env(env_path, llama_dir, bin_dir, server)
 
-    return {
+    info = {
         "tag": rel.get("tag_name"),
         "asset": name,
         "llama_dir": str(llama_dir),
@@ -130,6 +136,8 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
         "server": str(server),
         "skipped": False,
     }
+    show_summary("llama.cpp prebuilt", info)
+    return info
 
 
 def read_env_file(path):

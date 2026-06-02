@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llama-cpp-notebook"
-version = "0.1.0"
+version = "0.1.1"
 description = "Notebook helpers for llama.cpp GGUF backend on Colab and Kaggle"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["ipywidgets>=8"]
 
 [tool.setuptools]
 packages = ["gguf_backend"]

@@ -4,8 +4,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .terminal_panel import NotebookTerminalPanel, TerminalPanelConfig, run_terminal_panel
-from .ui import live_print
+from .panel import run_command, show_summary
 
 
 def filename_from_url(url: str) -> str:
@@ -34,6 +33,10 @@ def local_size(path):
     return path.stat().st_size if path.exists() else 0
 
 
+def _size_gib(num):
+    return f"{num / 1024**3:.2f} GiB"
+
+
 def download_with_aria_live(url, out_dir, out_name=None, *, token="", connections=16, clear=True):
     if not url:
         return ""
@@ -47,24 +50,12 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
     out_name = out_name or filename_from_url(url)
     out_path = out_dir / out_name
     remote_size = get_remote_size(url, token=token)
-    log_path = out_dir / f"{out_name}.aria2.log"
 
     if remote_size and local_size(out_path) >= remote_size:
-        if clear:
-            panel = NotebookTerminalPanel(enabled=True)
-            panel.update(
-                config=TerminalPanelConfig(
-                    label=f"download skipped: {out_name}",
-                    command_display="cached file already matches remote size",
-                    log_path=log_path,
-                ),
-                status="DONE",
-                elapsed_seconds=0.0,
-                exit_code=0,
-                lines=[f"size: {local_size(out_path) / 1024**3:.2f} GiB", str(out_path)],
-            )
-        else:
-            live_print(f"download complete: {out_name}\nsize: {local_size(out_path) / 1024**3:.2f} GiB", clear=False)
+        show_summary(
+            "Download skipped",
+            lines=[f"file: {out_path}", f"size: {_size_gib(local_size(out_path))}", "state: already complete"],
+        )
         return str(out_path)
 
     headers = []
@@ -74,26 +65,31 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
     cmd = [
         "aria2c", "-c", "-x", str(connections), "-s", str(connections), "-k", "1M",
         "--file-allocation=none", "--allow-overwrite=true", "--auto-file-renaming=false",
-        "--summary-interval=1", "--console-log-level=notice",
+        "--summary-interval=1", "--console-log-level=warn", "--show-console-readout=true",
+        "--retry-wait=3", "--max-tries=5",
         "-d", str(out_dir), "-o", out_name, *headers, url,
     ]
 
-    run_terminal_panel(
+    result = run_command(
         cmd,
-        TerminalPanelConfig(
-            label=f"download: {out_name}",
-            log_path=log_path,
-            tail_lines=20,
-            failure_tail_lines=30,
-        ),
-        display=clear,
+        label=f"download: {out_name}",
+        mode="download",
         check=True,
+        log_name=f"download_{Path(out_name).name}.log".replace("/", "_"),
+        tail_lines=120,
+        refresh_interval=0.10,
+        hide_redirects=True,
     )
 
     final_size = local_size(out_path)
     if final_size <= 0:
         raise RuntimeError(f"Downloaded file is empty: {out_path}")
 
+    show_summary(
+        "Download result",
+        lines=[f"file: {out_path}", f"size: {_size_gib(final_size)}", "state: complete"],
+        log_path=getattr(result, "log_path", None),
+    )
     return str(out_path)
 
 
@@ -121,4 +117,5 @@ def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connec
         cfg_path = model_dir / "model_config.json"
 
     cfg_path.write_text(json.dumps(cfg, indent=2))
+    show_summary("Model config", lines=[f"model_path: {model_path}", f"mmproj_path: {mmproj_path or '-'}", f"config: {cfg_path}"])
     return cfg

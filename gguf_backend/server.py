@@ -8,8 +8,8 @@ from pathlib import Path
 
 from .client import chat, get_json
 from .installer import read_env_file
-from .terminal_panel import NotebookTerminalPanel, TerminalPanelConfig
-from .ui import live_print, tail_text
+from .ui import tail_text
+from .panel import NotebookPanel, show_summary
 
 
 @dataclass
@@ -49,8 +49,13 @@ def port_is_open(host="127.0.0.1", port=8080, timeout=1):
 
 
 def get_help(server, env):
-    p = subprocess.run([str(server), "--help"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=40, env=env)
-    return p.stdout or ""
+    p = subprocess.Popen([str(server), "--help"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    try:
+        out, _ = p.communicate(timeout=40)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, _ = p.communicate()
+    return out or ""
 
 
 def has_flag(help_text, flag):
@@ -155,62 +160,44 @@ def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240):
     base = f"http://127.0.0.1:{cfg.port}"
     start = time.time()
     last = 0.0
-    panel = NotebookTerminalPanel(enabled=True)
-    panel_config = TerminalPanelConfig(
-        label="llama-server startup",
-        command_display=f"wait for {base}/health",
-        log_path=log_path,
-        tail_lines=20,
-        failure_tail_lines=40,
-    )
+    panel = NotebookPanel("llama-server", show_progress=False, height=330)
+    panel.display_panel()
+    panel.set_footer(f"log: {log_path}")
 
     while time.time() - start < timeout:
+        elapsed = int(time.time() - start)
         if proc.poll() is not None:
-            panel.update(
-                config=panel_config,
-                status="FAILED",
-                elapsed_seconds=time.time() - start,
-                exit_code=proc.returncode,
-                lines=tail_text(log_path, 40).splitlines(),
-            )
+            panel.lines = ["llama-server exited during startup", "", *tail_text(log_path, 120).splitlines()]
+            panel.finish(False, f"server exited | elapsed {elapsed}s")
             return False
 
         if port_is_open("127.0.0.1", cfg.port):
             try:
                 status, _ = get_json(base + "/health", timeout=5)
                 if status == 200:
-                    panel.update(
-                        config=panel_config,
-                        status="DONE",
-                        elapsed_seconds=time.time() - start,
-                        exit_code=0,
-                        lines=tail_text(log_path, 20).splitlines(),
-                    )
+                    panel.lines = [
+                        f"ready: {base}/v1/chat/completions",
+                        f"port: {cfg.port}",
+                        f"elapsed: {elapsed}s",
+                        "",
+                        *tail_text(log_path, 20).splitlines(),
+                    ]
+                    panel.finish(True, "llama-server ready")
                     return True
             except Exception:
                 pass
 
-        if time.time() - last >= 1:
-            panel.update(
-                config=panel_config,
-                status="RUNNING",
-                elapsed_seconds=time.time() - start,
-                exit_code=None,
-                lines=[f"port: {cfg.port}", *tail_text(log_path, 20).splitlines()],
-            )
+        if time.time() - last >= 0.5:
+            panel.set_status(f"starting | elapsed {elapsed}s | port {cfg.port}")
+            panel.lines = [f"base: {base}", f"pid: {proc.pid}", "", *tail_text(log_path, 60).splitlines()]
+            panel.render()
             last = time.time()
 
         time.sleep(0.5)
 
-    panel.update(
-        config=panel_config,
-        status="FAILED",
-        elapsed_seconds=time.time() - start,
-        exit_code=None,
-        lines=tail_text(log_path, 40).splitlines(),
-    )
+    panel.lines = ["llama-server startup timeout", "", *tail_text(log_path, 120).splitlines()]
+    panel.finish(False, f"startup timeout after {timeout}s")
     return False
-
 
 def start_server(cfg: ServerConfig, *, warmup=True):
     root = Path(cfg.root_dir)
@@ -247,14 +234,15 @@ def start_server(cfg: ServerConfig, *, warmup=True):
     if warmup:
         chat(base, cfg.alias, "ping", max_tokens=16)
 
-    live_print(
-        "\n".join([
-            "llama-server ready",
+    show_summary(
+        "llama-server ready",
+        lines=[
             f"local: {base}/v1/chat/completions",
             f"model: {cfg.alias}",
             f"pid: {proc.pid}",
-        ]),
-        clear=True,
+            f"log: {log_path}",
+        ],
+        log_path=log_path,
     )
 
     return {
