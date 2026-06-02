@@ -249,22 +249,58 @@ class NotebookPanel:
         self.set_dashboard(body)
 
     def set_links(self, title: str, links: dict[str, str], *, note: str = ""):
+        """Render endpoint rows.
+
+        links values may be either:
+          - "https://..."
+          - {"url": "https://...", "copy": True, "open": True}
+
+        Base/playground URLs should pass open=True so users can launch the
+        llama.cpp playground directly. API endpoints usually only need copy.
+        """
         cards = [f'<div style="font-weight:700;margin-bottom:8px;">{esc(title)}</div>']
         bindings = []
         if note:
             cards.append(f'<div style="color:#bbb;margin-bottom:8px;">{esc(note)}</div>')
-        for label, url in links.items():
+
+        for label, item in links.items():
+            if isinstance(item, dict):
+                url = str(item.get("url", ""))
+                can_copy = bool(item.get("copy", True))
+                can_open = bool(item.get("open", False))
+            else:
+                url = str(item)
+                can_copy = True
+                low_label = str(label).lower()
+                can_open = any(k in low_label for k in ("public", "playground", "base")) and url.startswith(("http://", "https://"))
+
             btn_id = f"btn_{uuid.uuid4().hex}"
             input_id = f"inp_{uuid.uuid4().hex}"
-            safe_url = esc(url)
+            safe_url_attr = html.escape(url, quote=True)
+            safe_url_text = esc(url)
+
+            actions = []
+            if can_open:
+                actions.append(
+                    f'<a href="{safe_url_attr}" target="_blank" rel="noopener noreferrer" '
+                    'style="background:#1f2937;color:#f8fafc;border:1px solid #64748b;'
+                    'border-radius:16px;padding:6px 12px;text-decoration:none;cursor:pointer;">open</a>'
+                )
+            if can_copy:
+                actions.append(
+                    f'<button id="{btn_id}" style="background:#222;color:#eee;border:1px solid #555;'
+                    'border-radius:16px;padding:6px 12px;cursor:pointer;">copy</button>'
+                )
+                bindings.append((btn_id, input_id))
+
             cards.append(f"""
-<div style=\"display:flex;gap:8px;align-items:center;margin:6px 0;\">
-  <div style=\"min-width:120px;color:#bbb;\">{esc(label)}</div>
-  <input id=\"{input_id}\" value=\"{safe_url}\" readonly style=\"flex:1;background:#050505;color:#e8e8e8;border:1px solid #444;padding:6px;font-family:inherit;font-size:12px;\" />
-  <button id=\"{btn_id}\" style=\"background:#222;color:#eee;border:1px solid #555;padding:6px 10px;cursor:pointer;\">copy</button>
+<div style=\"display:flex;gap:8px;align-items:center;margin:7px 0;\">
+  <div style=\"min-width:145px;color:#bbb;\">{esc(label)}</div>
+  <input id=\"{input_id}\" value=\"{safe_url_attr}\" readonly style=\"flex:1;background:#050505;color:#e8e8e8;border:1px solid #444;padding:7px;font-family:inherit;font-size:12px;\" />
+  <div style=\"display:flex;gap:6px;align-items:center;\">{''.join(actions)}</div>
 </div>
 """)
-            bindings.append((btn_id, input_id))
+
         self.set_dashboard("".join(cards))
         if self._widgets_ok:
             for btn_id, input_id in bindings:

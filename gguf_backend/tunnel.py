@@ -108,7 +108,15 @@ def start_cloudflare(port, root_dir, *, panel=None):
     panel.set_status("cloudflare tunnel ready")
     panel.render()
     if own_panel:
-        panel.set_links("tunnel result", {"cloudflare chat": url + "/v1/chat/completions"})
+        panel.set_links(
+            "tunnel result",
+            {
+                "cloudflare public": {"url": url, "copy": True, "open": True},
+                "cloudflare chat": {"url": url + "/v1/chat/completions", "copy": True, "open": False},
+                "cloudflare models": {"url": url + "/v1/models", "copy": True, "open": False},
+            },
+            note="Open the public URL for the llama.cpp playground, or copy /v1 endpoints for API clients.",
+        )
         panel.finish(True, "cloudflare tunnel ready")
     return url
 
@@ -155,12 +163,18 @@ def start_tunnels(port, root_dir, *, mode="both", ngrok_token="", fallback_cloud
     links = {}
     for name, url in urls.items():
         if not name.endswith("_error"):
-            links[f"{name} chat"] = url.rstrip("/") + "/v1/chat/completions"
-            links[f"{name} base"] = url.rstrip("/")
+            base = url.rstrip("/")
+            links[f"{name} public"] = {"url": base, "copy": True, "open": True}
+            links[f"{name} chat"] = {"url": base + "/v1/chat/completions", "copy": True, "open": False}
+            links[f"{name} models"] = {"url": base + "/v1/models", "copy": True, "open": False}
 
-    if links:
-        panel.set_links("tunnel result", links, note="Use the chat endpoint for OpenAI-compatible /v1/chat/completions clients.")
-    else:
+    if links and (finalize or own_panel):
+        panel.set_links(
+            "tunnel result",
+            links,
+            note="Open the public URL for the llama.cpp playground, or copy /v1 endpoints for API clients.",
+        )
+    elif not links and (finalize or own_panel):
         panel.set_summary("tunnel result", data=urls)
 
     if finalize or own_panel:

@@ -16,27 +16,67 @@ class ServerConfig:
     root_dir: str
     model_path: str
     mmproj_path: str = ""
+
+    # General config. These are intentionally explicit in the notebook.
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int | str = 8080
     alias: str = "local-vl"
-    ctx_size: int = 8192
-    gpu_layers: int = 999
+    ctx_size: int | str = 8192
+    gpu_layers: int | str = 999
+    cuda_visible_devices: str = "0,1"
     split_mode: str = "row"
     fallback_split_mode: str = "layer"
     tensor_split: str = "1,1"
-    threads: int = 4
-    threads_batch: int = 4
-    parallel: int = 1
-    batch_size: int = 2048
-    ubatch_size: int = 512
-    flash_attn: bool = True
-    cache_type_k: str = "f16"
-    cache_type_v: str = "f16"
-    image_min_tokens: int | None = None
-    image_max_tokens: int | None = None
-    chat_template_kwargs: str | None = None
-    mmproj_offload: bool = True
-    cuda_visible_devices: str = "0,1"
+
+    # Advanced config. Empty string means: do not pass the flag; use llama.cpp default.
+    main_gpu: int | str = ""
+    threads: int | str = ""
+    threads_batch: int | str = ""
+    threads_http: int | str = ""
+    parallel: int | str = ""
+    batch_size: int | str = ""
+    ubatch_size: int | str = ""
+    flash_attn: bool | str = ""
+    cache_type_k: str = ""
+    cache_type_v: str = ""
+    kv_offload: bool | str = ""
+    cont_batching: bool | str = ""
+    cache_prompt: bool | str = ""
+    cache_reuse: int | str = ""
+    mmap: bool | str = ""
+    mlock: bool | str = ""
+    no_perf: bool | str = ""
+    log_verbosity: int | str = ""
+
+    # Multimodal / template / reasoning. Empty string keeps llama.cpp defaults.
+    mmproj_offload: bool | str = ""
+    image_min_tokens: int | str = ""
+    image_max_tokens: int | str = ""
+    chat_template_kwargs: str = ""
+    chat_template: str = ""
+    chat_template_file: str = ""
+    jinja: bool | str = ""
+    reasoning: str = ""
+    reasoning_format: str = ""
+    reasoning_budget: int | str = ""
+    reasoning_budget_message: str = ""
+
+    # Server/API features. Empty string keeps llama.cpp defaults.
+    timeout: int | str = ""
+    api_key: str = ""
+    api_key_file: str = ""
+    api_prefix: str = ""
+    ui: bool | str = ""
+    metrics: bool | str = ""
+    slots: bool | str = ""
+    props: bool | str = ""
+    embedding: bool | str = ""
+    reranking: bool | str = ""
+    slot_save_path: str = ""
+    media_path: str = ""
+
+    # Escape hatch for new llama.cpp flags not wrapped yet.
+    extra_server_args: list[str] | tuple[str, ...] | str | None = None
 
 
 def port_is_open(host="127.0.0.1", port=8080, timeout=1):
@@ -95,50 +135,135 @@ def stop_server(root_dir):
             kill_pid(int(p.name))
 
 
+def _is_set(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) > 0
+    return True
+
+
+def _boolish(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+    return bool(value)
+
+
+def _onoff(value):
+    return "on" if _boolish(value) else "off"
+
+
+def _has_any(help_text, *flags):
+    return any(flag in help_text for flag in flags)
+
+
+def _add_value(cmd, help_text, flag, value, *aliases):
+    if _is_set(value) and _has_any(help_text, flag, *aliases):
+        cmd += [flag, str(value)]
+
+
+def _add_onoff(cmd, help_text, flag, value, *aliases):
+    if _is_set(value) and _has_any(help_text, flag, *aliases):
+        cmd += [flag, _onoff(value)]
+
+
+def _add_bool_flag(cmd, help_text, flag, value, *, no_flag=None):
+    if not _is_set(value):
+        return
+    enabled = _boolish(value)
+    if enabled and has_flag(help_text, flag):
+        cmd.append(flag)
+    elif not enabled and no_flag and has_flag(help_text, no_flag):
+        cmd.append(no_flag)
+
+
+def _extend_extra_args(cmd, extra_args):
+    if not _is_set(extra_args):
+        return
+    if isinstance(extra_args, str):
+        cmd.extend(extra_args.split())
+    else:
+        cmd.extend(str(x) for x in extra_args)
+
+
 def build_cmd(cfg: ServerConfig, help_text, server):
     cmd = [str(server), "-m", cfg.model_path]
 
     if cfg.mmproj_path and Path(cfg.mmproj_path).exists():
         cmd += ["--mmproj", cfg.mmproj_path]
-        if cfg.mmproj_offload and has_flag(help_text, "--mmproj-offload"):
-            cmd += ["--mmproj-offload"]
+        if _is_set(cfg.mmproj_offload):
+            _add_bool_flag(cmd, help_text, "--mmproj-offload", cfg.mmproj_offload)
 
-    cmd += [
-        "--host", cfg.host,
-        "--port", str(cfg.port),
-        "--alias", cfg.alias,
-        "-c", str(cfg.ctx_size),
-        "-t", str(cfg.threads),
-        "-ngl", str(cfg.gpu_layers),
-    ]
+    # General config. If user sets an empty string, skip the flag and use llama.cpp default.
+    _add_value(cmd, help_text, "--host", cfg.host)
+    _add_value(cmd, help_text, "--port", cfg.port)
+    _add_value(cmd, help_text, "--alias", cfg.alias)
+    _add_value(cmd, help_text, "-c", cfg.ctx_size, "--ctx-size")
+    _add_value(cmd, help_text, "-ngl", cfg.gpu_layers, "--n-gpu-layers")
+    _add_value(cmd, help_text, "--split-mode", cfg.split_mode)
+    if _is_set(cfg.tensor_split) and (not _is_set(cfg.split_mode) or str(cfg.split_mode) != "none"):
+        _add_value(cmd, help_text, "--tensor-split", cfg.tensor_split, "-ts")
 
-    if has_flag(help_text, "--parallel"):
-        cmd += ["--parallel", str(cfg.parallel)]
-    if has_flag(help_text, "--threads-batch"):
-        cmd += ["--threads-batch", str(cfg.threads_batch)]
-    if has_flag(help_text, "--batch-size"):
-        cmd += ["--batch-size", str(cfg.batch_size)]
-    if has_flag(help_text, "--ubatch-size"):
-        cmd += ["--ubatch-size", str(cfg.ubatch_size)]
-    if has_flag(help_text, "--split-mode"):
-        cmd += ["--split-mode", cfg.split_mode]
-    if has_flag(help_text, "--tensor-split") and cfg.split_mode != "none":
-        cmd += ["--tensor-split", cfg.tensor_split]
-    if cfg.flash_attn and has_flag(help_text, "--flash-attn"):
-        cmd += ["--flash-attn", "on"]
-    if cfg.cache_type_k and has_flag(help_text, "--cache-type-k"):
-        cmd += ["--cache-type-k", cfg.cache_type_k]
-    if cfg.cache_type_v and has_flag(help_text, "--cache-type-v"):
-        cmd += ["--cache-type-v", cfg.cache_type_v]
-    if cfg.image_min_tokens is not None and has_flag(help_text, "--image-min-tokens"):
-        cmd += ["--image-min-tokens", str(cfg.image_min_tokens)]
-    if cfg.image_max_tokens is not None and has_flag(help_text, "--image-max-tokens"):
-        cmd += ["--image-max-tokens", str(cfg.image_max_tokens)]
-    if cfg.chat_template_kwargs is not None and has_flag(help_text, "--chat-template-kwargs"):
-        cmd += ["--chat-template-kwargs", cfg.chat_template_kwargs]
+    # Advanced performance / memory.
+    _add_value(cmd, help_text, "--main-gpu", cfg.main_gpu, "-mg")
+    _add_value(cmd, help_text, "-t", cfg.threads, "--threads")
+    _add_value(cmd, help_text, "--threads-batch", cfg.threads_batch)
+    _add_value(cmd, help_text, "--threads-http", cfg.threads_http)
+    _add_value(cmd, help_text, "--parallel", cfg.parallel)
+    _add_value(cmd, help_text, "--batch-size", cfg.batch_size)
+    _add_value(cmd, help_text, "--ubatch-size", cfg.ubatch_size)
+    _add_onoff(cmd, help_text, "--flash-attn", cfg.flash_attn)
+    _add_value(cmd, help_text, "--cache-type-k", cfg.cache_type_k)
+    _add_value(cmd, help_text, "--cache-type-v", cfg.cache_type_v)
+    _add_onoff(cmd, help_text, "--kv-offload", cfg.kv_offload)
+    _add_bool_flag(cmd, help_text, "--cont-batching", cfg.cont_batching, no_flag="--no-cont-batching")
+    _add_bool_flag(cmd, help_text, "--cache-prompt", cfg.cache_prompt, no_flag="--no-cache-prompt")
+    _add_value(cmd, help_text, "--cache-reuse", cfg.cache_reuse)
+    _add_bool_flag(cmd, help_text, "--mmap", cfg.mmap, no_flag="--no-mmap")
+    _add_bool_flag(cmd, help_text, "--mlock", cfg.mlock, no_flag="--no-mlock")
+    _add_bool_flag(cmd, help_text, "--no-perf", cfg.no_perf)
+    _add_value(cmd, help_text, "--verbosity", cfg.log_verbosity, "--log-verbosity")
+
+    # Multimodal / template / reasoning.
+    _add_value(cmd, help_text, "--image-min-tokens", cfg.image_min_tokens)
+    _add_value(cmd, help_text, "--image-max-tokens", cfg.image_max_tokens)
+    _add_value(cmd, help_text, "--chat-template-kwargs", cfg.chat_template_kwargs)
+    _add_value(cmd, help_text, "--chat-template", cfg.chat_template)
+    _add_value(cmd, help_text, "--chat-template-file", cfg.chat_template_file)
+    _add_bool_flag(cmd, help_text, "--jinja", cfg.jinja, no_flag="--no-jinja")
+    _add_value(cmd, help_text, "--reasoning", cfg.reasoning, "-rea")
+    _add_value(cmd, help_text, "--reasoning-format", cfg.reasoning_format)
+    _add_value(cmd, help_text, "--reasoning-budget", cfg.reasoning_budget)
+    _add_value(cmd, help_text, "--reasoning-budget-message", cfg.reasoning_budget_message)
+
+    # Server/API features.
+    _add_value(cmd, help_text, "--timeout", cfg.timeout, "-to")
+    _add_value(cmd, help_text, "--api-key", cfg.api_key)
+    _add_value(cmd, help_text, "--api-key-file", cfg.api_key_file)
+    _add_value(cmd, help_text, "--api-prefix", cfg.api_prefix)
+    _add_bool_flag(cmd, help_text, "--ui", cfg.ui, no_flag="--no-ui")
+    _add_bool_flag(cmd, help_text, "--metrics", cfg.metrics)
+    _add_bool_flag(cmd, help_text, "--slots", cfg.slots, no_flag="--no-slots")
+    _add_bool_flag(cmd, help_text, "--props", cfg.props)
+    _add_bool_flag(cmd, help_text, "--embedding", cfg.embedding)
+    _add_bool_flag(cmd, help_text, "--reranking", cfg.reranking, no_flag="--no-reranking")
+    _add_value(cmd, help_text, "--slot-save-path", cfg.slot_save_path)
+    _add_value(cmd, help_text, "--media-path", cfg.media_path)
+
     if has_flag(help_text, "--log-colors"):
         cmd += ["--log-colors", "off"]
 
+    _extend_extra_args(cmd, cfg.extra_server_args)
     return cmd
 
 
@@ -225,7 +350,8 @@ def start_server(cfg: ServerConfig, *, warmup=True, panel=None):
 
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     env["LD_LIBRARY_PATH"] = f"{bin_dir}:{env.get('LD_LIBRARY_PATH', '')}"
-    env["CUDA_VISIBLE_DEVICES"] = cfg.cuda_visible_devices
+    if _is_set(cfg.cuda_visible_devices):
+        env["CUDA_VISIBLE_DEVICES"] = str(cfg.cuda_visible_devices)
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     help_text = get_help(server, env)

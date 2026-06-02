@@ -131,34 +131,32 @@ def download_assets(
         raise
 
 
+def _is_non_empty(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) > 0
+    return True
+
+
 def launch_backend(
     *,
     root_dir=None,
     model_config_path=None,
-    port=8080,
-    alias="local-vl",
-    ctx_size=8192,
-    split_mode="row",
-    fallback_split_mode="layer",
-    tensor_split="1,1",
-    threads=4,
-    threads_batch=4,
-    parallel=1,
-    batch_size=2048,
-    ubatch_size=512,
-    flash_attn=True,
-    cache_type_k="f16",
-    cache_type_v="f16",
-    image_min_tokens=None,
-    image_max_tokens=None,
-    chat_template_kwargs=None,
-    mmproj_offload=True,
-    cuda_visible_devices="0,1",
     warmup=True,
     tunnel_mode="both",
     ngrok_token="",
     fallback_cloudflare=True,
+    **server_options,
 ):
+    """Start llama-server, warm it up, and expose tunnels.
+
+    All llama-server options are passed as keyword arguments matching
+    ServerConfig fields. Empty string values are accepted and skipped by
+    the command builder, so llama.cpp defaults remain active.
+    """
     root_dir = _root(root_dir)
     model_config_path = Path(model_config_path or (Path(root_dir) / "model_config.json"))
 
@@ -172,37 +170,31 @@ def launch_backend(
             root_dir=root_dir,
             model_path=cfg_json["model_path"],
             mmproj_path=cfg_json.get("mmproj_path", ""),
-            port=port,
-            alias=alias,
-            ctx_size=ctx_size,
-            split_mode=split_mode,
-            fallback_split_mode=fallback_split_mode,
-            tensor_split=tensor_split,
-            threads=threads,
-            threads_batch=threads_batch,
-            parallel=parallel,
-            batch_size=batch_size,
-            ubatch_size=ubatch_size,
-            flash_attn=flash_attn,
-            cache_type_k=cache_type_k,
-            cache_type_v=cache_type_v,
-            image_min_tokens=image_min_tokens,
-            image_max_tokens=image_max_tokens,
-            chat_template_kwargs=chat_template_kwargs,
-            mmproj_offload=mmproj_offload,
-            cuda_visible_devices=cuda_visible_devices,
+            **server_options,
         )
+
+        selected = []
+        for key in [
+            "host", "port", "alias", "ctx_size", "gpu_layers", "cuda_visible_devices",
+            "split_mode", "tensor_split", "main_gpu", "parallel", "batch_size",
+            "ubatch_size", "flash_attn", "cache_type_k", "cache_type_v",
+            "reasoning", "reasoning_budget", "api_key", "ui", "metrics", "slots",
+        ]:
+            value = getattr(cfg, key, "")
+            if _is_non_empty(value):
+                if key == "api_key":
+                    value = "set"
+                selected.append(f"{key}: {value}")
 
         panel.set_summary(
             "launch config",
             lines=[
                 f"model: {cfg.model_path}",
                 f"mmproj: {cfg.mmproj_path or '-'}",
-                f"port: {port}",
-                f"ctx_size: {ctx_size}",
-                f"split_mode: {split_mode}",
                 f"tunnel_mode: {tunnel_mode}",
                 f"ngrok_token: {'set' if ngrok_token else 'empty'}",
+                "",
+                *selected,
             ],
         )
 
@@ -210,8 +202,9 @@ def launch_backend(
         server_info = start_server(cfg, warmup=warmup, panel=panel)
 
         panel.section("tunnel")
+        port_for_tunnel = int(cfg.port) if _is_non_empty(cfg.port) else 8080
         tunnel_urls = start_tunnels(
-            port,
+            port_for_tunnel,
             root_dir,
             mode=tunnel_mode,
             ngrok_token=ngrok_token,
@@ -221,16 +214,22 @@ def launch_backend(
         )
 
         links = {
-            "local chat": server_info["chat_endpoint"],
-            "local models": server_info["models_endpoint"],
+            "local base": {"url": server_info["base_url"], "copy": True, "open": False},
+            "local chat": {"url": server_info["chat_endpoint"], "copy": True, "open": False},
+            "local models": {"url": server_info["models_endpoint"], "copy": True, "open": False},
         }
         for name, url in tunnel_urls.items():
             if not name.endswith("_error"):
                 base = url.rstrip("/")
-                links[f"{name} chat"] = base + "/v1/chat/completions"
-                links[f"{name} models"] = base + "/v1/models"
+                links[f"{name} public"] = {"url": base, "copy": True, "open": True}
+                links[f"{name} chat"] = {"url": base + "/v1/chat/completions", "copy": True, "open": False}
+                links[f"{name} models"] = {"url": base + "/v1/models", "copy": True, "open": False}
 
-        panel.set_links("ready endpoints", links, note="Copy the chat endpoint for OpenAI-compatible clients.")
+        panel.set_links(
+            "ready endpoints",
+            links,
+            note="Open the public URL for the llama.cpp playground, or copy /v1 endpoints for OpenAI-compatible clients.",
+        )
         panel.append("")
         panel.append("backend ready")
         panel.render()
