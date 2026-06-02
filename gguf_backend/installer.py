@@ -7,7 +7,7 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-from .shell import run, run_live
+from .shell import run_live
 
 GITHUB_API_LLAMA_CUDA = "https://api.github.com/repos/ai-dock/llama.cpp-cuda/releases/latest"
 CLOUDFLARED_AMD64 = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -18,7 +18,11 @@ def ensure_apt_tools():
     packages = ["aria2", "curl", "wget", "tar", "unzip"]
     missing = [p for p in packages if shutil.which(p) is None]
     if missing:
-        run("apt-get update -qq && apt-get install -y -qq " + " ".join(missing), check=True)
+        run_live(
+            "apt-get update -qq && apt-get install -y -qq " + " ".join(missing),
+            label="install apt tools",
+            log_path="/tmp/llama_cpp_notebook_apt_tools.log",
+        )
 
 
 def arch_name():
@@ -92,6 +96,7 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
             "--summary-interval=1", "-d", str(dl_dir), "-o", name, url,
         ],
         label=f"download llama.cpp prebuilt: {name}",
+        log_path=dl_dir / f"{name}.download.log",
     )
 
     if llama_dir.exists():

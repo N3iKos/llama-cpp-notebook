@@ -1,8 +1,7 @@
 import re
-import time
 import subprocess
 
-from .ui import live_print
+from .terminal_panel import TerminalPanelConfig, run_terminal_panel
 
 CLOUDFLARE_URL_RE = re.compile(r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com")
 
@@ -29,85 +28,32 @@ def run(cmd, *, timeout=None, env=None, check=False, cwd=None, quiet=False):
     return p
 
 
-def run_live(cmd, *, label="process", env=None, cwd=None, timeout=None, clear=True, keep_last=25):
-    start = time.time()
-    cmd_display = cmd if isinstance(cmd, str) else " ".join(map(str, cmd))
-
-    proc = subprocess.Popen(
+def run_live(
+    cmd,
+    *,
+    label="process",
+    env=None,
+    cwd=None,
+    timeout=None,
+    clear=True,
+    keep_last=25,
+    log_path=None,
+):
+    del clear  # Kept for backward-compatible callers; panel updates in place.
+    result = run_terminal_panel(
         cmd,
-        shell=isinstance(cmd, str),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-        cwd=cwd,
-        bufsize=1,
+        TerminalPanelConfig(
+            label=label,
+            env=env,
+            cwd=cwd,
+            log_path=log_path,
+            tail_lines=keep_last,
+            failure_tail_lines=max(20, min(40, keep_last if keep_last > 25 else 30)),
+        ),
+        timeout=timeout,
+        check=True,
     )
-
-    lines = []
-    last_panel = 0.0
-
-    try:
-        while True:
-            if timeout and time.time() - start > timeout:
-                proc.kill()
-                raise TimeoutError(f"{label} timeout after {timeout}s")
-
-            line = proc.stdout.readline() if proc.stdout else ""
-
-            if line:
-                line = line.rstrip("\n")
-                if line:
-                    lines.append(line)
-                    lines = lines[-keep_last:]
-
-                now = time.time()
-                if now - last_panel >= 0.5:
-                    live_print(
-                        "\n".join([
-                            label,
-                            f"$ {cmd_display}",
-                            f"elapsed: {int(now - start)}s",
-                            "",
-                            *lines,
-                        ]),
-                        clear=clear,
-                    )
-                    last_panel = now
-
-            if proc.poll() is not None:
-                rest = proc.stdout.read() if proc.stdout else ""
-                if rest:
-                    lines.extend([x for x in rest.splitlines() if x.strip()])
-                    lines = lines[-keep_last:]
-                break
-
-            if not line:
-                time.sleep(0.1)
-
-        live_print(
-            "\n".join([
-                label,
-                f"$ {cmd_display}",
-                f"elapsed: {int(time.time() - start)}s",
-                f"exit: {proc.returncode}",
-                "",
-                *lines,
-            ]),
-            clear=clear,
-        )
-
-        if proc.returncode != 0:
-            raise RuntimeError(f"{label} failed with code {proc.returncode}")
-
-        return "\n".join(lines)
-
-    finally:
-        try:
-            if proc.poll() is None:
-                proc.kill()
-        except Exception:
-            pass
+    return "\n".join(result.tail_lines)
 
 
 def parse_trycloudflare_url(text):

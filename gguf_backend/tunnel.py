@@ -4,7 +4,8 @@ import time
 from pathlib import Path
 
 from .installer import ensure_cloudflared
-from .shell import parse_trycloudflare_url
+from .shell import parse_trycloudflare_url, run_live
+from .terminal_panel import NotebookTerminalPanel, TerminalPanelConfig
 from .ui import live_print
 
 
@@ -12,7 +13,11 @@ def start_ngrok(port, token):
     if not token:
         raise RuntimeError("ngrok token is empty.")
 
-    subprocess.run(["python3", "-m", "pip", "install", "-q", "pyngrok"], check=False)
+    run_live(
+        ["python3", "-m", "pip", "install", "-q", "pyngrok"],
+        label="install pyngrok",
+        log_path="/tmp/llama_cpp_notebook_pyngrok.log",
+    )
 
     from pyngrok import ngrok
     ngrok.set_auth_token(token)
@@ -44,31 +49,66 @@ def start_cloudflare(port, root_dir):
     start = time.time()
     lines = []
     url = None
+    panel = NotebookTerminalPanel(enabled=True)
+    panel_config = TerminalPanelConfig(
+        label="cloudflare tunnel startup",
+        command_display=" ".join(map(str, cmd)),
+        log_path=log_path,
+        tail_lines=15,
+        failure_tail_lines=40,
+    )
 
-    while time.time() - start < 60:
-        if proc.poll() is not None:
-            raise RuntimeError("cloudflared exited before URL was generated.")
+    try:
+        while time.time() - start < 60:
+            if proc.poll() is not None:
+                panel.update(
+                    config=panel_config,
+                    status="FAILED",
+                    elapsed_seconds=time.time() - start,
+                    exit_code=proc.returncode,
+                    lines=lines[-40:],
+                )
+                raise RuntimeError(f"cloudflared exited before URL was generated. log: {log_path}")
 
-        line = proc.stdout.readline() if proc.stdout else ""
-        if line:
-            logf.write(line)
-            logf.flush()
-            lines.append(line.strip())
-            lines = lines[-15:]
+            line = proc.stdout.readline() if proc.stdout else ""
+            if line:
+                logf.write(line)
+                logf.flush()
+                lines.append(line.strip())
+                lines = lines[-40:]
 
-            found = parse_trycloudflare_url(line)
-            if found:
-                url = found.rstrip("/")
-                break
+                found = parse_trycloudflare_url(line)
+                if found:
+                    url = found.rstrip("/")
+                    panel.update(
+                        config=panel_config,
+                        status="DONE",
+                        elapsed_seconds=time.time() - start,
+                        exit_code=0,
+                        lines=[*lines[-14:], f"url: {url}"],
+                    )
+                    break
 
-        live_print(
-            "\n".join(["cloudflare tunnel starting", f"elapsed: {int(time.time() - start)}s", *lines[-8:]]),
-            clear=True,
-        )
-        time.sleep(0.2)
+            panel.update(
+                config=panel_config,
+                status="RUNNING",
+                elapsed_seconds=time.time() - start,
+                exit_code=None,
+                lines=lines[-15:],
+            )
+            time.sleep(0.2)
+    finally:
+        logf.close()
 
     if not url:
-        raise RuntimeError("cloudflare tunnel URL not found in output.")
+        panel.update(
+            config=panel_config,
+            status="FAILED",
+            elapsed_seconds=time.time() - start,
+            exit_code=None,
+            lines=lines[-40:],
+        )
+        raise RuntimeError(f"cloudflare tunnel URL not found in output. log: {log_path}")
 
     return url
 

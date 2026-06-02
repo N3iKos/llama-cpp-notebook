@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .client import chat, get_json
 from .installer import read_env_file
+from .terminal_panel import NotebookTerminalPanel, TerminalPanelConfig
 from .ui import live_print, tail_text
 
 
@@ -154,36 +155,60 @@ def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240):
     base = f"http://127.0.0.1:{cfg.port}"
     start = time.time()
     last = 0.0
+    panel = NotebookTerminalPanel(enabled=True)
+    panel_config = TerminalPanelConfig(
+        label="llama-server startup",
+        command_display=f"wait for {base}/health",
+        log_path=log_path,
+        tail_lines=20,
+        failure_tail_lines=40,
+    )
 
     while time.time() - start < timeout:
         if proc.poll() is not None:
-            live_print("llama-server exited during startup\n\n" + tail_text(log_path, 120), clear=True)
+            panel.update(
+                config=panel_config,
+                status="FAILED",
+                elapsed_seconds=time.time() - start,
+                exit_code=proc.returncode,
+                lines=tail_text(log_path, 40).splitlines(),
+            )
             return False
 
         if port_is_open("127.0.0.1", cfg.port):
             try:
                 status, _ = get_json(base + "/health", timeout=5)
                 if status == 200:
+                    panel.update(
+                        config=panel_config,
+                        status="DONE",
+                        elapsed_seconds=time.time() - start,
+                        exit_code=0,
+                        lines=tail_text(log_path, 20).splitlines(),
+                    )
                     return True
             except Exception:
                 pass
 
         if time.time() - last >= 1:
-            live_print(
-                "\n".join([
-                    "llama-server starting",
-                    f"elapsed: {int(time.time() - start)}s",
-                    f"port: {cfg.port}",
-                    "",
-                    tail_text(log_path, 20),
-                ]),
-                clear=True,
+            panel.update(
+                config=panel_config,
+                status="RUNNING",
+                elapsed_seconds=time.time() - start,
+                exit_code=None,
+                lines=[f"port: {cfg.port}", *tail_text(log_path, 20).splitlines()],
             )
             last = time.time()
 
         time.sleep(0.5)
 
-    live_print("llama-server startup timeout\n\n" + tail_text(log_path, 120), clear=True)
+    panel.update(
+        config=panel_config,
+        status="FAILED",
+        elapsed_seconds=time.time() - start,
+        exit_code=None,
+        lines=tail_text(log_path, 40).splitlines(),
+    )
     return False
 
 

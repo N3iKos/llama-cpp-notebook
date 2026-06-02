@@ -1,12 +1,10 @@
 import json
-import os
 import shutil
-import subprocess
-import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from .terminal_panel import NotebookTerminalPanel, TerminalPanelConfig, run_terminal_panel
 from .ui import live_print
 
 
@@ -49,9 +47,24 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
     out_name = out_name or filename_from_url(url)
     out_path = out_dir / out_name
     remote_size = get_remote_size(url, token=token)
+    log_path = out_dir / f"{out_name}.aria2.log"
 
     if remote_size and local_size(out_path) >= remote_size:
-        live_print(f"download complete: {out_name}\nsize: {local_size(out_path) / 1024**3:.2f} GiB", clear=clear)
+        if clear:
+            panel = NotebookTerminalPanel(enabled=True)
+            panel.update(
+                config=TerminalPanelConfig(
+                    label=f"download skipped: {out_name}",
+                    command_display="cached file already matches remote size",
+                    log_path=log_path,
+                ),
+                status="DONE",
+                elapsed_seconds=0.0,
+                exit_code=0,
+                lines=[f"size: {local_size(out_path) / 1024**3:.2f} GiB", str(out_path)],
+            )
+        else:
+            live_print(f"download complete: {out_name}\nsize: {local_size(out_path) / 1024**3:.2f} GiB", clear=False)
         return str(out_path)
 
     headers = []
@@ -65,62 +78,23 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
         "-d", str(out_dir), "-o", out_name, *headers, url,
     ]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    start = time.time()
-    last_line = ""
-    last_update = 0.0
-    history = []
+    run_terminal_panel(
+        cmd,
+        TerminalPanelConfig(
+            label=f"download: {out_name}",
+            log_path=log_path,
+            tail_lines=20,
+            failure_tail_lines=30,
+        ),
+        display=clear,
+        check=True,
+    )
 
-    try:
-        while True:
-            line = proc.stdout.readline() if proc.stdout else ""
-            now = time.time()
+    final_size = local_size(out_path)
+    if final_size <= 0:
+        raise RuntimeError(f"Downloaded file is empty: {out_path}")
 
-            if line:
-                line = line.strip()
-                if line:
-                    history.append(line)
-                    history = history[-10:]
-                    if line.startswith("[#") or "ETA:" in line or "DL:" in line:
-                        last_line = line
-
-            current = local_size(out_path)
-            if now - last_update >= 0.5:
-                if remote_size:
-                    pct = min(100.0, current / remote_size * 100)
-                    size_line = f"{current / 1024**2:.0f}MiB/{remote_size / 1024**3:.2f}GiB ({pct:.1f}%)"
-                else:
-                    size_line = f"{current / 1024**2:.0f}MiB"
-
-                live_print("\n".join([f"download: {out_name}", f"elapsed: {int(now - start)}s", last_line or size_line]), clear=clear)
-                last_update = now
-
-            if proc.poll() is not None:
-                rest = proc.stdout.read() if proc.stdout else ""
-                if rest:
-                    history.extend([x for x in rest.splitlines() if x.strip()])
-                break
-
-            if not line:
-                time.sleep(0.1)
-
-        if proc.returncode != 0:
-            live_print("\n".join([f"download failed: {out_name}", *history[-20:]]), clear=clear)
-            raise RuntimeError(f"aria2c failed for {out_name} with code {proc.returncode}")
-
-        final_size = local_size(out_path)
-        if final_size <= 0:
-            raise RuntimeError(f"Downloaded file is empty: {out_path}")
-
-        live_print(f"download complete: {out_name}\nsize: {final_size / 1024**3:.2f} GiB", clear=clear)
-        return str(out_path)
-
-    finally:
-        try:
-            if proc.poll() is None:
-                proc.kill()
-        except Exception:
-            pass
+    return str(out_path)
 
 
 def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connections=16):
