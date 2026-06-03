@@ -13,8 +13,8 @@ from pathlib import Path
 
 from .downloader import download_model_pair
 from .installer import ensure_apt_tools, install_llama_cpp_prebuilt, read_env_file
-from .panel import NotebookPanel, run_command
-from .server import ServerConfig, start_server
+from .panel import NotebookPanel, run_command, tail_text
+from .server import ServerConfig, start_server, shutdown_all
 from .tunnel import start_tunnels
 
 
@@ -149,6 +149,7 @@ def launch_backend(
     tunnel_mode="both",
     ngrok_token="",
     fallback_cloudflare=True,
+    thinking_config=None,
     **server_options,
 ):
     """Start llama-server, warm it up, and expose tunnels.
@@ -156,6 +157,12 @@ def launch_backend(
     All llama-server options are passed as keyword arguments matching
     ServerConfig fields. Empty string values are accepted and skipped by
     the command builder, so llama.cpp defaults remain active.
+
+    Parameters
+    ----------
+    thinking_config : dict, optional
+        Model-aware reasoning/thinking toggle config.  Keys: ``family``,
+        ``mode``, ``budget``, ``format``, ``soft_prompt``.
     """
     root_dir = _root(root_dir)
     model_config_path = Path(model_config_path or (Path(root_dir) / "model_config.json"))
@@ -170,6 +177,7 @@ def launch_backend(
             root_dir=root_dir,
             model_path=cfg_json["model_path"],
             mmproj_path=cfg_json.get("mmproj_path", ""),
+            thinking_config=thinking_config,
             **server_options,
         )
 
@@ -200,6 +208,18 @@ def launch_backend(
 
         panel.section("start llama-server")
         server_info = start_server(cfg, warmup=warmup, panel=panel)
+
+        # Display thinking mapper summary (if thinking_config was used).
+        thinking_result = getattr(cfg, "_thinking_result", None)
+        if thinking_result and thinking_result.summary:
+            panel.section("thinking mapper")
+            for k, v in thinking_result.summary.items():
+                panel.append(f"  {k}: {v}")
+            if thinking_result.warnings:
+                panel.append("")
+                for w in thinking_result.warnings:
+                    panel.append(f"  ⚠ {w}")
+            panel.render()
 
         panel.section("tunnel")
         port_for_tunnel = int(cfg.port) if _is_non_empty(cfg.port) else 8080
@@ -241,3 +261,211 @@ def launch_backend(
         panel.append(f"ERROR: {type(e).__name__}: {e}")
         panel.finish(False, "launch failed")
         raise
+
+
+def launch_backend_live(
+    *,
+    root_dir=None,
+    model_config_path=None,
+    warmup=True,
+    tunnel_mode="both",
+    ngrok_token="",
+    fallback_cloudflare=True,
+    thinking_config=None,
+    health_interval=5,
+    log_refresh=1.0,
+    **server_options,
+):
+    """Start llama-server with tunnels, then enter a live monitoring loop.
+
+    This function wraps ``launch_backend()`` and then continuously streams
+    the server log file and performs periodic health checks. A prominent
+    **Shutdown** button is displayed; clicking it kills the llama-server,
+    cloudflared, and ngrok processes and cleanly exits the monitoring loop.
+
+    The cell that calls this function will keep running until either:
+    - The user clicks the Shutdown button, or
+    - The llama-server process dies unexpectedly.
+
+    Parameters
+    ----------
+    root_dir : str, optional
+        Working directory. Auto-detected for Kaggle/Colab if omitted.
+    model_config_path : str, optional
+        Path to ``model_config.json``. Defaults to ``<root>/model_config.json``.
+    warmup : bool
+        Send a warmup chat request before declaring ready.
+    tunnel_mode : str
+        ``"both"``, ``"ngrok"``, ``"cloudflare"``, or ``"none"``.
+    ngrok_token : str
+        ngrok auth token. Empty = skip ngrok.
+    fallback_cloudflare : bool
+        Start cloudflare if ngrok fails.
+    health_interval : int
+        Seconds between ``/health`` checks (default 5).
+    log_refresh : float
+        Seconds between log tail refreshes (default 1.0).
+    **server_options
+        Keyword arguments forwarded to ``ServerConfig``.
+
+    Returns
+    -------
+    dict
+        Same as ``launch_backend()`` plus ``{"shutdown_status": ...}``.
+    """
+    import threading
+    import time
+
+    from .client import get_json
+
+    root_dir = _root(root_dir)
+
+    # ── Phase 1: delegate to launch_backend() for the initial setup ──
+    result = launch_backend(
+        root_dir=root_dir,
+        model_config_path=model_config_path,
+        warmup=warmup,
+        tunnel_mode=tunnel_mode,
+        ngrok_token=ngrok_token,
+        fallback_cloudflare=fallback_cloudflare,
+        thinking_config=thinking_config,
+        **server_options,
+    )
+
+    base_url = result["server"]["base_url"]
+    log_path = Path(result["server"]["log_path"])
+    server_pid = result["server"]["pid"]
+
+    # ── Phase 2: create the live monitoring panel ──
+    panel = NotebookPanel(
+        "Cell 3 — live server monitor",
+        show_progress=False,
+        height=380,
+    )
+    panel.display_panel()
+    panel.set_footer(f"log: {log_path} | pid: {server_pid}")
+
+    # Re-display the endpoint links in the live panel dashboard.
+    if "links" in result:
+        panel.set_links(
+            "ready endpoints",
+            result["links"],
+            note="Open the public URL for the llama.cpp playground, or copy /v1 endpoints for OpenAI-compatible clients.",
+        )
+
+    # ── Phase 3: wire up the shutdown button ──
+    shutdown_event = threading.Event()
+
+    def _do_shutdown():
+        """Callback invoked by the shutdown button click."""
+        panel.append("")
+        panel.append("═" * 80)
+        panel.append("SHUTDOWN REQUESTED")
+        panel.append("═" * 80)
+        panel.render()
+
+        status = shutdown_all(root_dir)
+        for component, state in status.items():
+            panel.append(f"  {component}: {state}")
+        panel.render()
+
+        result["shutdown_status"] = status
+        shutdown_event.set()
+
+    panel.add_shutdown_button(_do_shutdown)
+    panel.set_live_status("server running", "#4ade80")
+    panel.section("live log")
+    panel.set_status("live monitoring | server running")
+    panel.render()
+
+    # ── Phase 4: continuous monitoring loop ──
+    last_health_check = 0.0
+    health_ok = True
+    uptime_start = time.time()
+
+    try:
+        while not shutdown_event.is_set():
+            now = time.time()
+            uptime_secs = int(now - uptime_start)
+            uptime_str = _format_uptime(uptime_secs)
+
+            # --- Stream log tail ---
+            log_tail = tail_text(log_path, 60)
+            panel.lines = log_tail.splitlines() if log_tail else ["(no log output yet)"]
+
+            # --- Periodic health check ---
+            if now - last_health_check >= health_interval:
+                try:
+                    status_code, _ = get_json(base_url + "/health", timeout=5)
+                    if status_code == 200:
+                        if not health_ok:
+                            panel.append("")
+                            panel.append(f"[{_ts()}] server recovered")
+                        health_ok = True
+                        panel.set_live_status(
+                            f"server healthy | uptime {uptime_str} | pid {server_pid}",
+                            "#4ade80",
+                        )
+                        panel.set_status(f"live monitoring | healthy | uptime {uptime_str}")
+                    else:
+                        health_ok = False
+                        panel.set_live_status(
+                            f"server unhealthy (HTTP {status_code}) | uptime {uptime_str}",
+                            "#facc15",
+                        )
+                        panel.set_status(f"live monitoring | unhealthy | uptime {uptime_str}")
+                except Exception:
+                    health_ok = False
+                    panel.set_live_status(
+                        f"server unreachable | uptime {uptime_str}",
+                        "#f87171",
+                    )
+                    panel.set_status(f"live monitoring | unreachable | uptime {uptime_str}")
+                last_health_check = now
+
+            # --- Check if the server process is still alive ---
+            try:
+                os.kill(server_pid, 0)  # signal 0 = check existence
+            except OSError:
+                panel.append("")
+                panel.append(f"[{_ts()}] server process (pid {server_pid}) is no longer running")
+                panel.set_live_status("server process died", "#f87171")
+                panel.set_status("server process died")
+                panel.render()
+                break
+
+            panel.render()
+
+            # Sleep in small increments so shutdown is responsive.
+            shutdown_event.wait(timeout=log_refresh)
+
+    except KeyboardInterrupt:
+        panel.append("")
+        panel.append(f"[{_ts()}] keyboard interrupt — shutting down")
+        panel.render()
+        shutdown_all(root_dir)
+
+    # ── Phase 5: finalize ──
+    panel.set_shutdown_complete()
+    panel.append("")
+    panel.append(f"[{_ts()}] monitoring stopped")
+    panel.render()
+
+    return result
+
+
+def _format_uptime(seconds: int) -> str:
+    """Convert seconds to a human-readable uptime string."""
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins}m {secs}s"
+
+
+def _ts() -> str:
+    """Short HH:MM:SS timestamp for log lines."""
+    import time as _time
+    return _time.strftime("%H:%M:%S")

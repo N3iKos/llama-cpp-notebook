@@ -7,18 +7,28 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-from .shell import run, run_live
+from .panel import run_command, show_summary
 
 GITHUB_API_LLAMA_CUDA = "https://api.github.com/repos/ai-dock/llama.cpp-cuda/releases/latest"
 CLOUDFLARED_AMD64 = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 CLOUDFLARED_ARM64 = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
 
 
-def ensure_apt_tools():
+def ensure_apt_tools(panel=None):
     packages = ["aria2", "curl", "wget", "tar", "unzip"]
     missing = [p for p in packages if shutil.which(p) is None]
     if missing:
-        run("apt-get update -qq && apt-get install -y -qq " + " ".join(missing), check=True)
+        run_command(
+            "apt-get update -qq && apt-get install -y -qq " + " ".join(missing),
+            check=True,
+            label="install apt tools",
+            panel=panel,
+            finalize=False if panel else True,
+            tail_lines=160,
+        )
+    elif panel:
+        panel.append("apt tools: already available")
+        panel.render()
 
 
 def arch_name():
@@ -69,11 +79,14 @@ def save_env(env_path, llama_dir, bin_dir, server):
     )
 
 
-def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False):
+def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False, panel=None):
     root_dir = Path(root_dir)
     dl_dir = root_dir / "_downloads"
     llama_dir = root_dir / "llama.cpp-cuda"
     dl_dir.mkdir(parents=True, exist_ok=True)
+
+    if panel:
+        panel.section("install llama.cpp prebuilt")
 
     if not force:
         existing = list(llama_dir.rglob("llama-server"))
@@ -82,21 +95,43 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
             bin_dir = server.parent
             env_path = root_dir / "llama_env.sh"
             save_env(env_path, llama_dir, bin_dir, server)
-            return {"llama_dir": str(llama_dir), "bin_dir": str(bin_dir), "server": str(server), "skipped": True}
+            info = {"llama_dir": str(llama_dir), "bin_dir": str(bin_dir), "server": str(server), "skipped": True}
+            if panel:
+                panel.set_summary("llama.cpp prebuilt", data=info)
+                panel.append(f"llama.cpp prebuilt: already installed at {server}")
+                panel.render()
+            else:
+                show_summary("llama.cpp prebuilt", info)
+            return info
 
     rel, asset = latest_llama_cuda_asset(cuda_preference=cuda_preference)
     url = asset["browser_download_url"]
     name = asset["name"]
     tar_path = dl_dir / name
 
-    ensure_apt_tools()
-    run_live(
+    ensure_apt_tools(panel=panel)
+    run_command(
         [
             "aria2c", "-c", "-x", "8", "-s", "8", "-k", "1M",
-            "--summary-interval=1", "-d", str(dl_dir), "-o", name, url,
+            "--summary-interval=1", "--console-log-level=warn", "--show-console-readout=true",
+            "--allow-overwrite=true", "--auto-file-renaming=false",
+            "-d", str(dl_dir), "-o", name, url,
         ],
         label=f"download llama.cpp prebuilt: {name}",
+        mode="download",
+        check=True,
+        panel=panel,
+        finalize=False if panel else True,
+        log_name=f"download_{name}.log".replace("/", "_"),
+        tail_lines=140,
+        refresh_interval=0.10,
     )
+
+    if panel:
+        panel.set_progress_visible(False)
+        panel.set_status("extracting llama.cpp prebuilt...")
+        panel.append(f"extract: {tar_path} -> {llama_dir}")
+        panel.render()
 
     if llama_dir.exists():
         shutil.rmtree(llama_dir)
@@ -121,7 +156,7 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
     env_path = root_dir / "llama_env.sh"
     save_env(env_path, llama_dir, bin_dir, server)
 
-    return {
+    info = {
         "tag": rel.get("tag_name"),
         "asset": name,
         "llama_dir": str(llama_dir),
@@ -129,6 +164,13 @@ def install_llama_cpp_prebuilt(root_dir, *, cuda_preference="12.8", force=False)
         "server": str(server),
         "skipped": False,
     }
+    if panel:
+        panel.set_summary("llama.cpp prebuilt", data=info)
+        panel.append(f"server: {server}")
+        panel.render()
+    else:
+        show_summary("llama.cpp prebuilt", info)
+    return info
 
 
 def read_env_file(path):
@@ -143,9 +185,12 @@ def read_env_file(path):
     return env
 
 
-def ensure_cloudflared(target_dir):
+def ensure_cloudflared(target_dir, panel=None):
     existing = shutil.which("cloudflared")
     if existing:
+        if panel:
+            panel.append(f"cloudflared: {existing}")
+            panel.render()
         return existing
 
     url = CLOUDFLARED_AMD64 if arch_name() == "amd64" else CLOUDFLARED_ARM64
@@ -153,6 +198,9 @@ def ensure_cloudflared(target_dir):
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / "cloudflared"
 
+    if panel:
+        panel.append(f"download cloudflared: {url}")
+        panel.render()
     urllib.request.urlretrieve(url, target)
     target.chmod(0o755)
     return str(target)
