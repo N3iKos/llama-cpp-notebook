@@ -26,6 +26,7 @@ def run_colab(
     image_min_tokens=None,
     image_max_tokens=None,
     chat_template_kwargs=None,
+    thinking_config=None,
     mmproj_offload=True,
     port=8080,
     alias="local-vl",
@@ -64,6 +65,7 @@ def run_colab(
         image_min_tokens=image_min_tokens,
         image_max_tokens=image_max_tokens,
         chat_template_kwargs=chat_template_kwargs,
+        thinking_config=thinking_config,
         mmproj_offload=mmproj_offload,
         cuda_visible_devices="0",
     )
