@@ -313,12 +313,18 @@ def launch_backend_live(
     dict
         Same as ``launch_backend()`` plus ``{"shutdown_status": ...}``.
     """
+    import signal
     import threading
     import time
 
     from .client import get_json
 
     root_dir = _root(root_dir)
+    shutdown_flag_path = Path(root_dir) / "shutdown.flag"
+
+    # Clean up any stale flag from a previous run.
+    if shutdown_flag_path.exists():
+        shutdown_flag_path.unlink(missing_ok=True)
 
     # ── Phase 1: delegate to launch_backend() for the initial setup ──
     result = launch_backend(
@@ -354,6 +360,21 @@ def launch_backend_live(
         )
 
     # ── Phase 3: wire up the shutdown button ──
+    #
+    # In Jupyter/Kaggle/Colab, ipywidgets button callbacks may run on the
+    # same IOLoop as the blocked cell.  We use TWO complementary mechanisms
+    # to guarantee the shutdown signal is received:
+    #
+    #   A) File-based flag:  The callback writes ``shutdown.flag`` to disk.
+    #      The main loop polls for this file every iteration (~1s).
+    #
+    #   B) SIGINT:  After killing processes, the callback sends SIGINT to
+    #      the current process.  This interrupts any blocking call in the
+    #      main loop (``time.sleep`` / ``Event.wait``) and raises
+    #      KeyboardInterrupt, which the loop catches gracefully.
+    #
+    # Together these handle every runtime quirk of Kaggle and Colab kernels.
+
     shutdown_event = threading.Event()
 
     def _do_shutdown():
@@ -364,13 +385,29 @@ def launch_backend_live(
         panel.append("═" * 80)
         panel.render()
 
+        # 1. Kill all server/tunnel processes.
         status = shutdown_all(root_dir)
         for component, state in status.items():
             panel.append(f"  {component}: {state}")
         panel.render()
 
         result["shutdown_status"] = status
+
+        # 2. Write file-based shutdown flag (polled by the main loop).
+        try:
+            shutdown_flag_path.write_text("shutdown")
+        except OSError:
+            pass
+
+        # 3. Set threading event (in case the IOLoop does dispatch it).
         shutdown_event.set()
+
+        # 4. Send SIGINT to interrupt the cell.  This is the nuclear option
+        #    that guarantees the blocking main loop will exit.
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except OSError:
+            pass
 
     panel.add_shutdown_button(_do_shutdown)
     panel.set_live_status("server running", "#4ade80")
@@ -383,8 +420,16 @@ def launch_backend_live(
     health_ok = True
     uptime_start = time.time()
 
+    def _should_stop():
+        """Check all shutdown signals: threading event OR flag file."""
+        if shutdown_event.is_set():
+            return True
+        if shutdown_flag_path.exists():
+            return True
+        return False
+
     try:
-        while not shutdown_event.is_set():
+        while not _should_stop():
             now = time.time()
             uptime_secs = int(now - uptime_start)
             uptime_str = _format_uptime(uptime_secs)
@@ -437,19 +482,30 @@ def launch_backend_live(
             panel.render()
 
             # Sleep in small increments so shutdown is responsive.
-            shutdown_event.wait(timeout=log_refresh)
+            # Use time.sleep instead of Event.wait for broader compatibility.
+            time.sleep(log_refresh)
 
     except KeyboardInterrupt:
-        panel.append("")
-        panel.append(f"[{_ts()}] keyboard interrupt — shutting down")
-        panel.render()
-        shutdown_all(root_dir)
+        # This is the EXPECTED path when the shutdown button sends SIGINT,
+        # or when the user manually interrupts the cell.
+        if not shutdown_event.is_set() and not shutdown_flag_path.exists():
+            # Manual interrupt (not from our button) — kill processes too.
+            panel.append("")
+            panel.append(f"[{_ts()}] keyboard interrupt — shutting down")
+            panel.render()
+            shutdown_all(root_dir)
 
     # ── Phase 5: finalize ──
     panel.set_shutdown_complete()
     panel.append("")
-    panel.append(f"[{_ts()}] monitoring stopped")
+    panel.append(f"[{_ts()}] monitoring stopped — you can re-run this cell to restart the server")
     panel.render()
+
+    # Clean up the flag file.
+    try:
+        shutdown_flag_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
     return result
 
