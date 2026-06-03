@@ -1,10 +1,13 @@
 import json
+import os
 import shutil
+import subprocess
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .panel import run_command, show_summary
+from .ui import live_print
 
 
 def filename_from_url(url: str) -> str:
@@ -33,11 +36,7 @@ def local_size(path):
     return path.stat().st_size if path.exists() else 0
 
 
-def _size_gib(num):
-    return f"{num / 1024**3:.2f} GiB"
-
-
-def download_with_aria_live(url, out_dir, out_name=None, *, token="", connections=16, clear=True, panel=None):
+def download_with_aria_live(url, out_dir, out_name=None, *, token="", connections=16, clear=True):
     if not url:
         return ""
 
@@ -52,13 +51,7 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
     remote_size = get_remote_size(url, token=token)
 
     if remote_size and local_size(out_path) >= remote_size:
-        lines = [f"file: {out_path}", f"size: {_size_gib(local_size(out_path))}", "state: already complete"]
-        if panel:
-            panel.append(f"download skipped: {out_path}")
-            panel.set_summary("download skipped", lines=lines)
-            panel.render()
-        else:
-            show_summary("download skipped", lines=lines)
+        live_print(f"download complete: {out_name}\nsize: {local_size(out_path) / 1024**3:.2f} GiB", clear=clear)
         return str(out_path)
 
     headers = []
@@ -68,50 +61,75 @@ def download_with_aria_live(url, out_dir, out_name=None, *, token="", connection
     cmd = [
         "aria2c", "-c", "-x", str(connections), "-s", str(connections), "-k", "1M",
         "--file-allocation=none", "--allow-overwrite=true", "--auto-file-renaming=false",
-        "--summary-interval=1", "--console-log-level=warn", "--show-console-readout=true",
-        "--retry-wait=3", "--max-tries=5",
+        "--summary-interval=1", "--console-log-level=notice",
         "-d", str(out_dir), "-o", out_name, *headers, url,
     ]
 
-    result = run_command(
-        cmd,
-        label=f"download: {out_name}",
-        mode="download",
-        check=True,
-        log_name=f"download_{Path(out_name).name}.log".replace("/", "_"),
-        tail_lines=160,
-        refresh_interval=0.10,
-        hide_redirects=True,
-        panel=panel,
-        finalize=False if panel else True,
-    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    start = time.time()
+    last_line = ""
+    last_update = 0.0
+    history = []
 
-    final_size = local_size(out_path)
-    if final_size <= 0:
-        raise RuntimeError(f"Downloaded file is empty: {out_path}")
+    try:
+        while True:
+            line = proc.stdout.readline() if proc.stdout else ""
+            now = time.time()
 
-    lines = [f"file: {out_path}", f"size: {_size_gib(final_size)}", "state: complete"]
-    if panel:
-        panel.set_summary("download result", lines=lines)
-        panel.append(f"download complete: {out_path}")
-        panel.render()
-    else:
-        show_summary("download result", lines=lines, log_path=getattr(result, "log_path", None))
-    return str(out_path)
+            if line:
+                line = line.strip()
+                if line:
+                    history.append(line)
+                    history = history[-10:]
+                    if line.startswith("[#") or "ETA:" in line or "DL:" in line:
+                        last_line = line
+
+            current = local_size(out_path)
+            if now - last_update >= 0.5:
+                if remote_size:
+                    pct = min(100.0, current / remote_size * 100)
+                    size_line = f"{current / 1024**2:.0f}MiB/{remote_size / 1024**3:.2f}GiB ({pct:.1f}%)"
+                else:
+                    size_line = f"{current / 1024**2:.0f}MiB"
+
+                live_print("\n".join([f"download: {out_name}", f"elapsed: {int(now - start)}s", last_line or size_line]), clear=clear)
+                last_update = now
+
+            if proc.poll() is not None:
+                rest = proc.stdout.read() if proc.stdout else ""
+                if rest:
+                    history.extend([x for x in rest.splitlines() if x.strip()])
+                break
+
+            if not line:
+                time.sleep(0.1)
+
+        if proc.returncode != 0:
+            live_print("\n".join([f"download failed: {out_name}", *history[-20:]]), clear=clear)
+            raise RuntimeError(f"aria2c failed for {out_name} with code {proc.returncode}")
+
+        final_size = local_size(out_path)
+        if final_size <= 0:
+            raise RuntimeError(f"Downloaded file is empty: {out_path}")
+
+        live_print(f"download complete: {out_name}\nsize: {final_size / 1024**3:.2f} GiB", clear=clear)
+        return str(out_path)
+
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
 
 
-def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connections=16, panel=None):
+def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connections=16):
     model_dir = Path(model_dir)
-
-    if panel:
-        panel.section("download model")
-    model_path = download_with_aria_live(model_url, model_dir, token=hf_token, connections=connections, panel=panel)
+    model_path = download_with_aria_live(model_url, model_dir, token=hf_token, connections=connections)
 
     mmproj_path = ""
     if mmproj_url:
-        if panel:
-            panel.section("download mmproj")
-        mmproj_path = download_with_aria_live(mmproj_url, model_dir, token=hf_token, connections=connections, panel=panel)
+        mmproj_path = download_with_aria_live(mmproj_url, model_dir, token=hf_token, connections=connections)
 
     cfg = {
         "model_path": model_path,
@@ -129,11 +147,4 @@ def download_model_pair(model_url, mmproj_url, model_dir, *, hf_token="", connec
         cfg_path = model_dir / "model_config.json"
 
     cfg_path.write_text(json.dumps(cfg, indent=2))
-    cfg["config_path"] = str(cfg_path)
-
-    if panel:
-        panel.set_summary("model config", data=cfg)
-        panel.render()
-    else:
-        show_summary("model config", cfg)
     return cfg

@@ -11,7 +11,7 @@ from pathlib import Path
 from .client import chat, get_json
 from .installer import ensure_cloudflared, read_env_file
 from .panel import NotebookPanel, sanitize_log_line, tail_text
-from .server import ServerConfig, build_cmd, get_help, kill_pid, port_is_open, start_once, stop_server
+from .server import ServerConfig, build_cmd, get_help, kill_pid, port_is_open, sanitize_cmd, start_once, stop_server
 from .thinking import build_thinking_args
 from .shell import parse_trycloudflare_url
 
@@ -166,6 +166,10 @@ def _start_server_panel(cfg: ServerConfig, panel, *, stop_event=None):
             model_path=cfg.model_path,
             alias=cfg.alias,
             existing_chat_template_kwargs=cfg.chat_template_kwargs,
+            manual_reasoning=cfg.reasoning,
+            manual_reasoning_budget=cfg.reasoning_budget,
+            manual_reasoning_format=cfg.reasoning_format,
+            manual_jinja=cfg.jinja,
         )
         panel.append("thinking mapper:")
         for line in thinking_summary:
@@ -175,7 +179,7 @@ def _start_server_panel(cfg: ServerConfig, panel, *, stop_event=None):
 
     proc, cmd, log_path = start_once(cfg, env, server, help_text)
     panel.set_footer(f"server log: {log_path}")
-    panel.append("$ " + " ".join(str(x) for x in cmd))
+    panel.append("$ " + sanitize_cmd(cmd))
     panel.render()
 
     ok = _wait_ready_panel(proc, cfg, log_path, panel, stop_event=stop_event)
@@ -212,7 +216,7 @@ def _start_cloudflare_panel(port, root_dir, panel, *, stop_event=None, timeout=7
     pid_path.write_text(str(proc.pid))
 
     panel.section("cloudflare tunnel")
-    panel.append("$ " + " ".join(cmd))
+    panel.append("$ " + sanitize_cmd(cmd))
     panel.render()
 
     start = time.time()

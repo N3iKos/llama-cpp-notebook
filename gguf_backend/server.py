@@ -1,5 +1,7 @@
 import os
+import re
 import signal
+import shlex
 import socket
 import subprocess
 import time
@@ -8,7 +10,8 @@ from pathlib import Path
 
 from .client import chat, get_json
 from .installer import read_env_file
-from .panel import NotebookPanel, show_summary, tail_text
+from .ui import live_print, tail_text
+from .thinking import build_thinking_args
 
 
 @dataclass
@@ -16,67 +19,99 @@ class ServerConfig:
     root_dir: str
     model_path: str
     mmproj_path: str = ""
-
-    # General config. These are intentionally explicit in the notebook.
     host: str = "0.0.0.0"
-    port: int | str = 8080
+    port: int = 8080
     alias: str = "local-vl"
-    ctx_size: int | str = 8192
-    gpu_layers: int | str = 999
-    cuda_visible_devices: str = "0,1"
+    ctx_size: int = 8192
+    gpu_layers: int = 999
     split_mode: str = "row"
     fallback_split_mode: str = "layer"
     tensor_split: str = "1,1"
+    threads: int = 4
+    threads_batch: int = 4
+    parallel: int = 1
+    batch_size: int = 2048
+    ubatch_size: int = 512
+    flash_attn: bool = True
+    cache_type_k: str = "f16"
+    cache_type_v: str = "f16"
+    image_min_tokens: int | None = None
+    image_max_tokens: int | None = None
+    chat_template_kwargs: str | None = None
+    reasoning: str | None = None
+    reasoning_budget: str | None = None
+    reasoning_format: str | None = None
+    jinja: bool = False
+    mmproj_offload: bool = True
+    cuda_visible_devices: str = "0,1"
+    extra_server_args: list[str] | tuple[str, ...] | None = None
+    thinking_config: dict | None = None
 
-    # Advanced config. Empty string means: do not pass the flag; use llama.cpp default.
-    main_gpu: int | str = ""
-    threads: int | str = ""
-    threads_batch: int | str = ""
-    threads_http: int | str = ""
-    parallel: int | str = ""
-    batch_size: int | str = ""
-    ubatch_size: int | str = ""
-    flash_attn: bool | str = ""
-    cache_type_k: str = ""
-    cache_type_v: str = ""
-    kv_offload: bool | str = ""
-    cont_batching: bool | str = ""
-    cache_prompt: bool | str = ""
-    cache_reuse: int | str = ""
-    mmap: bool | str = ""
-    mlock: bool | str = ""
-    no_perf: bool | str = ""
-    log_verbosity: int | str = ""
 
-    # Multimodal / template / reasoning. Empty string keeps llama.cpp defaults.
-    mmproj_offload: bool | str = ""
-    image_min_tokens: int | str = ""
-    image_max_tokens: int | str = ""
-    chat_template_kwargs: str = ""
-    chat_template: str = ""
-    chat_template_file: str = ""
-    jinja: bool | str = ""
-    reasoning: str = ""
-    reasoning_format: str = ""
-    reasoning_budget: int | str = ""
-    reasoning_budget_message: str = ""
 
-    # Server/API features. Empty string keeps llama.cpp defaults.
-    timeout: int | str = ""
-    api_key: str = ""
-    api_key_file: str = ""
-    api_prefix: str = ""
-    ui: bool | str = ""
-    metrics: bool | str = ""
-    slots: bool | str = ""
-    props: bool | str = ""
-    embedding: bool | str = ""
-    reranking: bool | str = ""
-    slot_save_path: str = ""
-    media_path: str = ""
+SECRET_FLAG_RE = re.compile(r"(token|key|secret|password|passwd|auth)", re.I)
+BOOLEAN_WORDS = {"on", "off", "true", "false", "1", "0", "yes", "no"}
+ON_WORDS = {"on", "true", "1", "yes"}
+TOGGLE_FLAGS = {"--ui": "--no-ui", "--jinja": ""}
+ENABLE_ONLY_FLAGS = {"--metrics", "--props", "--slots"}
 
-    # Escape hatch for new llama.cpp flags not wrapped yet.
-    extra_server_args: list[str] | tuple[str, ...] | str | None = None
+
+def sanitize_cmd(cmd):
+    """Return a display-safe command string with secrets redacted."""
+    if isinstance(cmd, str):
+        parts = shlex.split(cmd)
+    else:
+        parts = [str(x) for x in cmd]
+    redacted = []
+    hide_next = False
+    for part in parts:
+        if hide_next:
+            redacted.append("***")
+            hide_next = False
+            continue
+        if part.startswith("--") and "=" in part:
+            key, _ = part.split("=", 1)
+            if SECRET_FLAG_RE.search(key):
+                redacted.append(key + "=***")
+            else:
+                redacted.append(part)
+            continue
+        redacted.append(part)
+        if part.startswith("-") and SECRET_FLAG_RE.search(part):
+            hide_next = True
+    return " ".join(shlex.quote(x) for x in redacted)
+
+
+def normalize_extra_server_args(args):
+    """Keep manual extra args, but fix common invalid boolean forms for toggle flags."""
+    if isinstance(args, str):
+        raw_items = shlex.split(args)
+    else:
+        raw_items = []
+        for item in (args or []):
+            text = str(item)
+            raw_items.extend(shlex.split(text) if any(ch.isspace() for ch in text) else [text])
+    items = raw_items
+    out = []
+    i = 0
+    while i < len(items):
+        flag = items[i]
+        low = flag.lower()
+        if low in TOGGLE_FLAGS or low in ENABLE_ONLY_FLAGS:
+            next_value = items[i + 1].strip().lower() if i + 1 < len(items) else ""
+            if next_value in BOOLEAN_WORDS:
+                if next_value in ON_WORDS:
+                    out.append(flag)
+                elif low in TOGGLE_FLAGS and TOGGLE_FLAGS[low]:
+                    out.append(TOGGLE_FLAGS[low])
+                i += 2
+                continue
+            out.append(flag)
+            i += 1
+            continue
+        out.append(flag)
+        i += 1
+    return out
 
 
 def port_is_open(host="127.0.0.1", port=8080, timeout=1):
@@ -88,13 +123,8 @@ def port_is_open(host="127.0.0.1", port=8080, timeout=1):
 
 
 def get_help(server, env):
-    p = subprocess.Popen([str(server), "--help"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
-    try:
-        out, _ = p.communicate(timeout=40)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        out, _ = p.communicate()
-    return out or ""
+    p = subprocess.run([str(server), "--help"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=40, env=env)
+    return p.stdout or ""
 
 
 def has_flag(help_text, flag):
@@ -135,135 +165,79 @@ def stop_server(root_dir):
             kill_pid(int(p.name))
 
 
-def _is_set(value):
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip() != ""
-    if isinstance(value, (list, tuple, dict, set)):
-        return len(value) > 0
-    return True
-
-
-def _boolish(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
-            return True
-        if v in {"0", "false", "no", "n", "off", "disable", "disabled"}:
-            return False
-    return bool(value)
-
-
-def _onoff(value):
-    return "on" if _boolish(value) else "off"
-
-
-def _has_any(help_text, *flags):
-    return any(flag in help_text for flag in flags)
-
-
-def _add_value(cmd, help_text, flag, value, *aliases):
-    if _is_set(value) and _has_any(help_text, flag, *aliases):
-        cmd += [flag, str(value)]
-
-
-def _add_onoff(cmd, help_text, flag, value, *aliases):
-    if _is_set(value) and _has_any(help_text, flag, *aliases):
-        cmd += [flag, _onoff(value)]
-
-
-def _add_bool_flag(cmd, help_text, flag, value, *, no_flag=None):
-    if not _is_set(value):
-        return
-    enabled = _boolish(value)
-    if enabled and has_flag(help_text, flag):
-        cmd.append(flag)
-    elif not enabled and no_flag and has_flag(help_text, no_flag):
-        cmd.append(no_flag)
-
-
-def _extend_extra_args(cmd, extra_args):
-    if not _is_set(extra_args):
-        return
-    if isinstance(extra_args, str):
-        cmd.extend(extra_args.split())
-    else:
-        cmd.extend(str(x) for x in extra_args)
-
-
 def build_cmd(cfg: ServerConfig, help_text, server):
     cmd = [str(server), "-m", cfg.model_path]
 
     if cfg.mmproj_path and Path(cfg.mmproj_path).exists():
         cmd += ["--mmproj", cfg.mmproj_path]
-        if _is_set(cfg.mmproj_offload):
-            _add_bool_flag(cmd, help_text, "--mmproj-offload", cfg.mmproj_offload)
+        if cfg.mmproj_offload and has_flag(help_text, "--mmproj-offload"):
+            cmd += ["--mmproj-offload"]
 
-    # General config. If user sets an empty string, skip the flag and use llama.cpp default.
-    _add_value(cmd, help_text, "--host", cfg.host)
-    _add_value(cmd, help_text, "--port", cfg.port)
-    _add_value(cmd, help_text, "--alias", cfg.alias)
-    _add_value(cmd, help_text, "-c", cfg.ctx_size, "--ctx-size")
-    _add_value(cmd, help_text, "-ngl", cfg.gpu_layers, "--n-gpu-layers")
-    _add_value(cmd, help_text, "--split-mode", cfg.split_mode)
-    if _is_set(cfg.tensor_split) and (not _is_set(cfg.split_mode) or str(cfg.split_mode) != "none"):
-        _add_value(cmd, help_text, "--tensor-split", cfg.tensor_split, "-ts")
+    cmd += [
+        "--host", cfg.host,
+        "--port", str(cfg.port),
+        "--alias", cfg.alias,
+        "-c", str(cfg.ctx_size),
+        "-t", str(cfg.threads),
+        "-ngl", str(cfg.gpu_layers),
+    ]
 
-    # Advanced performance / memory.
-    _add_value(cmd, help_text, "--main-gpu", cfg.main_gpu, "-mg")
-    _add_value(cmd, help_text, "-t", cfg.threads, "--threads")
-    _add_value(cmd, help_text, "--threads-batch", cfg.threads_batch)
-    _add_value(cmd, help_text, "--threads-http", cfg.threads_http)
-    _add_value(cmd, help_text, "--parallel", cfg.parallel)
-    _add_value(cmd, help_text, "--batch-size", cfg.batch_size)
-    _add_value(cmd, help_text, "--ubatch-size", cfg.ubatch_size)
-    _add_onoff(cmd, help_text, "--flash-attn", cfg.flash_attn)
-    _add_value(cmd, help_text, "--cache-type-k", cfg.cache_type_k)
-    _add_value(cmd, help_text, "--cache-type-v", cfg.cache_type_v)
-    _add_onoff(cmd, help_text, "--kv-offload", cfg.kv_offload)
-    _add_bool_flag(cmd, help_text, "--cont-batching", cfg.cont_batching, no_flag="--no-cont-batching")
-    _add_bool_flag(cmd, help_text, "--cache-prompt", cfg.cache_prompt, no_flag="--no-cache-prompt")
-    _add_value(cmd, help_text, "--cache-reuse", cfg.cache_reuse)
-    _add_bool_flag(cmd, help_text, "--mmap", cfg.mmap, no_flag="--no-mmap")
-    _add_bool_flag(cmd, help_text, "--mlock", cfg.mlock, no_flag="--no-mlock")
-    _add_bool_flag(cmd, help_text, "--no-perf", cfg.no_perf)
-    _add_value(cmd, help_text, "--verbosity", cfg.log_verbosity, "--log-verbosity")
-
-    # Multimodal / template / reasoning.
-    _add_value(cmd, help_text, "--image-min-tokens", cfg.image_min_tokens)
-    _add_value(cmd, help_text, "--image-max-tokens", cfg.image_max_tokens)
-    _add_value(cmd, help_text, "--chat-template-kwargs", cfg.chat_template_kwargs)
-    _add_value(cmd, help_text, "--chat-template", cfg.chat_template)
-    _add_value(cmd, help_text, "--chat-template-file", cfg.chat_template_file)
-    _add_bool_flag(cmd, help_text, "--jinja", cfg.jinja, no_flag="--no-jinja")
-    _add_value(cmd, help_text, "--reasoning", cfg.reasoning, "-rea")
-    _add_value(cmd, help_text, "--reasoning-format", cfg.reasoning_format)
-    _add_value(cmd, help_text, "--reasoning-budget", cfg.reasoning_budget)
-    _add_value(cmd, help_text, "--reasoning-budget-message", cfg.reasoning_budget_message)
-
-    # Server/API features.
-    _add_value(cmd, help_text, "--timeout", cfg.timeout, "-to")
-    _add_value(cmd, help_text, "--api-key", cfg.api_key)
-    _add_value(cmd, help_text, "--api-key-file", cfg.api_key_file)
-    _add_value(cmd, help_text, "--api-prefix", cfg.api_prefix)
-    _add_bool_flag(cmd, help_text, "--ui", cfg.ui, no_flag="--no-ui")
-    _add_bool_flag(cmd, help_text, "--metrics", cfg.metrics)
-    _add_bool_flag(cmd, help_text, "--slots", cfg.slots, no_flag="--no-slots")
-    _add_bool_flag(cmd, help_text, "--props", cfg.props)
-    _add_bool_flag(cmd, help_text, "--embedding", cfg.embedding)
-    _add_bool_flag(cmd, help_text, "--reranking", cfg.reranking, no_flag="--no-reranking")
-    _add_value(cmd, help_text, "--slot-save-path", cfg.slot_save_path)
-    _add_value(cmd, help_text, "--media-path", cfg.media_path)
-
+    if has_flag(help_text, "--parallel"):
+        cmd += ["--parallel", str(cfg.parallel)]
+    if has_flag(help_text, "--threads-batch"):
+        cmd += ["--threads-batch", str(cfg.threads_batch)]
+    if has_flag(help_text, "--batch-size"):
+        cmd += ["--batch-size", str(cfg.batch_size)]
+    if has_flag(help_text, "--ubatch-size"):
+        cmd += ["--ubatch-size", str(cfg.ubatch_size)]
+    if has_flag(help_text, "--split-mode"):
+        cmd += ["--split-mode", cfg.split_mode]
+    if has_flag(help_text, "--tensor-split") and cfg.split_mode != "none":
+        cmd += ["--tensor-split", cfg.tensor_split]
+    if cfg.flash_attn not in (None, "") and has_flag(help_text, "--flash-attn"):
+        if isinstance(cfg.flash_attn, bool):
+            cmd += ["--flash-attn", "on" if cfg.flash_attn else "off"]
+        else:
+            fa = str(cfg.flash_attn).strip().lower()
+            if fa in ("on", "off", "auto"):
+                cmd += ["--flash-attn", fa]
+    if cfg.cache_type_k and has_flag(help_text, "--cache-type-k"):
+        cmd += ["--cache-type-k", cfg.cache_type_k]
+    if cfg.cache_type_v and has_flag(help_text, "--cache-type-v"):
+        cmd += ["--cache-type-v", cfg.cache_type_v]
+    if cfg.image_min_tokens is not None and has_flag(help_text, "--image-min-tokens"):
+        cmd += ["--image-min-tokens", str(cfg.image_min_tokens)]
+    if cfg.image_max_tokens is not None and has_flag(help_text, "--image-max-tokens"):
+        cmd += ["--image-max-tokens", str(cfg.image_max_tokens)]
+    if cfg.thinking_config:
+        thinking_args, _, _ = build_thinking_args(
+            cfg.thinking_config,
+            help_text=help_text,
+            model_path=cfg.model_path,
+            alias=cfg.alias,
+            existing_chat_template_kwargs=cfg.chat_template_kwargs,
+            manual_reasoning=cfg.reasoning,
+            manual_reasoning_budget=cfg.reasoning_budget,
+            manual_reasoning_format=cfg.reasoning_format,
+            manual_jinja=cfg.jinja,
+        )
+        cmd += thinking_args
+    else:
+        if cfg.jinja and has_flag(help_text, "--jinja"):
+            cmd += ["--jinja"]
+        if cfg.chat_template_kwargs is not None and str(cfg.chat_template_kwargs).strip() and has_flag(help_text, "--chat-template-kwargs"):
+            cmd += ["--chat-template-kwargs", str(cfg.chat_template_kwargs).strip()]
+        if cfg.reasoning is not None and str(cfg.reasoning).strip() and has_flag(help_text, "--reasoning"):
+            cmd += ["--reasoning", str(cfg.reasoning).strip()]
+        if cfg.reasoning_budget is not None and str(cfg.reasoning_budget).strip() and has_flag(help_text, "--reasoning-budget"):
+            cmd += ["--reasoning-budget", str(cfg.reasoning_budget).strip()]
+        if cfg.reasoning_format is not None and str(cfg.reasoning_format).strip() and has_flag(help_text, "--reasoning-format"):
+            cmd += ["--reasoning-format", str(cfg.reasoning_format).strip()]
     if has_flag(help_text, "--log-colors"):
         cmd += ["--log-colors", "off"]
+    if cfg.extra_server_args:
+        cmd += normalize_extra_server_args(cfg.extra_server_args)
 
-    _extend_extra_args(cmd, cfg.extra_server_args)
     return cmd
 
 
@@ -280,65 +254,44 @@ def start_once(cfg: ServerConfig, env, server, help_text):
     return proc, cmd, log_path
 
 
-def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240, panel=None):
+def wait_ready(proc, cfg: ServerConfig, log_path, timeout=240):
     base = f"http://127.0.0.1:{cfg.port}"
     start = time.time()
     last = 0.0
-    own_panel = panel is None
-    if panel is None:
-        panel = NotebookPanel("llama-server", show_progress=False, height=330)
-    panel.display_panel()
-    panel.set_progress_visible(False)
-    panel.set_footer(f"log: {log_path}")
 
     while time.time() - start < timeout:
-        elapsed = int(time.time() - start)
         if proc.poll() is not None:
-            panel.lines = ["llama-server exited during startup", "", *tail_text(log_path, 120).splitlines()]
-            if own_panel:
-                panel.finish(False, f"server exited | elapsed {elapsed}s")
-            else:
-                panel.set_status(f"server exited | elapsed {elapsed}s")
-                panel.render()
+            live_print("llama-server exited during startup\n\n" + tail_text(log_path, 120), clear=True)
             return False
 
         if port_is_open("127.0.0.1", cfg.port):
             try:
                 status, _ = get_json(base + "/health", timeout=5)
                 if status == 200:
-                    panel.lines = [
-                        f"ready: {base}/v1/chat/completions",
-                        f"port: {cfg.port}",
-                        f"elapsed: {elapsed}s",
-                        "",
-                        *tail_text(log_path, 20).splitlines(),
-                    ]
-                    if own_panel:
-                        panel.finish(True, "llama-server ready")
-                    else:
-                        panel.set_status("llama-server ready")
-                        panel.render()
                     return True
             except Exception:
                 pass
 
-        if time.time() - last >= 0.5:
-            panel.set_status(f"starting | elapsed {elapsed}s | port {cfg.port}")
-            panel.lines = [f"base: {base}", f"pid: {proc.pid}", "", *tail_text(log_path, 60).splitlines()]
-            panel.render()
+        if time.time() - last >= 1:
+            live_print(
+                "\n".join([
+                    "llama-server starting",
+                    f"elapsed: {int(time.time() - start)}s",
+                    f"port: {cfg.port}",
+                    "",
+                    tail_text(log_path, 20),
+                ]),
+                clear=True,
+            )
             last = time.time()
 
         time.sleep(0.5)
 
-    panel.lines = ["llama-server startup timeout", "", *tail_text(log_path, 120).splitlines()]
-    if own_panel:
-        panel.finish(False, f"startup timeout after {timeout}s")
-    else:
-        panel.set_status(f"startup timeout after {timeout}s")
-        panel.render()
+    live_print("llama-server startup timeout\n\n" + tail_text(log_path, 120), clear=True)
     return False
 
-def start_server(cfg: ServerConfig, *, warmup=True, panel=None):
+
+def start_server(cfg: ServerConfig, *, warmup=True):
     root = Path(cfg.root_dir)
     env = read_env_file(root / "llama_env.sh")
 
@@ -350,21 +303,20 @@ def start_server(cfg: ServerConfig, *, warmup=True, panel=None):
 
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     env["LD_LIBRARY_PATH"] = f"{bin_dir}:{env.get('LD_LIBRARY_PATH', '')}"
-    if _is_set(cfg.cuda_visible_devices):
-        env["CUDA_VISIBLE_DEVICES"] = str(cfg.cuda_visible_devices)
+    env["CUDA_VISIBLE_DEVICES"] = cfg.cuda_visible_devices
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     help_text = get_help(server, env)
     stop_server(cfg.root_dir)
 
     proc, cmd, log_path = start_once(cfg, env, server, help_text)
-    ok = wait_ready(proc, cfg, log_path, panel=panel)
+    ok = wait_ready(proc, cfg, log_path)
 
     if not ok and cfg.fallback_split_mode and cfg.fallback_split_mode != cfg.split_mode:
         kill_pid(proc.pid)
         cfg.split_mode = cfg.fallback_split_mode
         proc, cmd, log_path = start_once(cfg, env, server, help_text)
-        ok = wait_ready(proc, cfg, log_path, panel=panel)
+        ok = wait_ready(proc, cfg, log_path)
 
     if not ok:
         raise RuntimeError("llama-server failed to start.")
@@ -372,24 +324,17 @@ def start_server(cfg: ServerConfig, *, warmup=True, panel=None):
     base = f"http://127.0.0.1:{cfg.port}"
 
     if warmup:
-        if panel:
-            panel.section("warmup")
-            panel.set_status("warmup request...")
         chat(base, cfg.alias, "ping", max_tokens=16)
-        if panel:
-            panel.append("warmup: ok")
-            panel.render()
 
-    ready_lines = [
-        f"local: {base}/v1/chat/completions",
-        f"model: {cfg.alias}",
-        f"pid: {proc.pid}",
-        f"log: {log_path}",
-    ]
-    if panel:
-        panel.set_summary("llama-server ready", lines=ready_lines)
-    else:
-        show_summary("llama-server ready", lines=ready_lines, log_path=log_path)
+    live_print(
+        "\n".join([
+            "llama-server ready",
+            f"local: {base}/v1/chat/completions",
+            f"model: {cfg.alias}",
+            f"pid: {proc.pid}",
+        ]),
+        clear=True,
+    )
 
     return {
         "base_url": base,

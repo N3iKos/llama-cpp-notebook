@@ -2,210 +2,357 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
+from typing import Any
 
 
-def has_flag(help_text: str, flag: str) -> bool:
+REASONING_HEAVY_MARKERS = {
+    "deepseek-r1": "DeepSeek-R1",
+    "qwq": "QwQ",
+    "phi-4-reasoning": "Phi-4 reasoning",
+    "magistral": "Magistral",
+}
+
+SUPPORTED_FAMILIES = {
+    "auto",
+    "gemma4",
+    "qwen3",
+    "deepseek-v31",
+    "glm",
+    "hermes4",
+    "gpt-oss",
+    "reasoning-heavy",
+    "none",
+}
+
+
+def _normalize_text(*parts: str) -> str:
+    text = " ".join(str(p or "") for p in parts).lower()
+    return text.replace("_", "-")
+
+
+def _is_filled(value: Any) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def _mode(value: Any, default: str = "auto") -> str:
+    value = str(value if value is not None else default).strip().lower()
+    return value or default
+
+
+def _clean_format(value: Any) -> str:
+    value = str(value or "").strip()
+    if value.lower() == "none":
+        return "none"
+    return value
+
+
+def _json_dumps(data: dict[str, Any]) -> str:
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+
+def _parse_kwargs(value: Any, warnings: list[str], label: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    text = str(value).strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        warnings.append(f"{label} chat_template_kwargs is not valid JSON; it was not merged.")
+        return {}
+    if not isinstance(parsed, dict):
+        warnings.append(f"{label} chat_template_kwargs must be a JSON object; it was not merged.")
+        return {}
+    return parsed
+
+
+def detect_thinking_family(model_path: str, alias: str = "") -> str:
+    """Detect the thinking-control family from a GGUF path/name and alias."""
+    name = _normalize_text(model_path, alias)
+
+    if re.search(r"gemma-?4", name):
+        return "gemma4"
+    if re.search(r"qwen-?3(?:\.\d+)?", name):
+        return "qwen3"
+    if re.search(r"deepseek-v?3\.1|deepseek-v31", name):
+        return "deepseek-v31"
+    if re.search(r"glm-?4|glm-?5|z\.ai|\bzai\b", name):
+        return "glm"
+    if re.search(r"hermes-?4", name):
+        return "hermes4"
+    if re.search(r"gpt-?oss", name):
+        return "gpt-oss"
+    if re.search(r"deepseek-r1|qwq|phi-?4-?reasoning|magistral", name):
+        return "reasoning-heavy"
+    return "none"
+
+
+# Backward-compatible name used by older code/tests.
+detect_family = detect_thinking_family
+
+
+def merge_chat_template_kwargs(
+    mapper_kwargs: dict[str, Any] | None,
+    manual_kwargs: dict[str, Any] | str | None = None,
+    *,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    """Merge template kwargs with manual values taking precedence."""
+    warnings = warnings if warnings is not None else []
+    merged = dict(mapper_kwargs or {})
+    manual = _parse_kwargs(manual_kwargs, warnings, "manual")
+    merged.update(manual)
+    return merged
+
+
+def build_thinking_plan(thinking_config: dict | None, model_path: str, alias: str = "") -> dict[str, Any]:
+    """Build a model-aware thinking plan without checking binary flag support."""
+    cfg = dict(thinking_config or {})
+    requested_family = str(cfg.get("family", "auto") or "auto").strip().lower()
+    detected_family = detect_thinking_family(model_path, alias)
+    family = detected_family if requested_family in {"", "auto"} else requested_family
+    if family not in SUPPORTED_FAMILIES:
+        family = "none" if requested_family == "off" else requested_family
+
+    mode = _mode(cfg.get("mode", "auto"), "auto")
+    budget = str(cfg.get("budget", "") or "").strip()
+    fmt = _clean_format(cfg.get("format", ""))
+    soft_prompt = str(cfg.get("soft_prompt", "") or "").strip()
+
+    plan: dict[str, Any] = {
+        "requested_family": requested_family,
+        "detected_family": detected_family,
+        "family": family,
+        "mode": mode,
+        "effective_mode": mode,
+        "budget": budget,
+        "format": fmt,
+        "soft_prompt": soft_prompt,
+        "jinja": False,
+        "chat_template_kwargs": {},
+        "reasoning": None,
+        "reasoning_budget": None,
+        "reasoning_format": None,
+        "warnings": [],
+    }
+
+    def set_reasoning(value: str | None, budget_value: str | None = None, fmt_value: str | None = None):
+        plan["reasoning"] = value
+        if budget_value is not None and str(budget_value).strip() != "":
+            plan["reasoning_budget"] = str(budget_value).strip()
+        if fmt_value is not None and str(fmt_value).strip() != "":
+            plan["reasoning_format"] = str(fmt_value).strip()
+
+    if family == "none":
+        plan["effective_mode"] = "disabled"
+        return plan
+
+    if family in {"gemma4", "qwen3"}:
+        plan["jinja"] = True
+        if mode == "on":
+            plan["chat_template_kwargs"] = {"enable_thinking": True}
+            set_reasoning("on", budget or ("-1" if family == "gemma4" else None), fmt or None)
+        elif mode == "off":
+            plan["chat_template_kwargs"] = {"enable_thinking": False}
+            set_reasoning("off", budget or ("0" if family == "gemma4" else None), fmt or None)
+        elif mode == "auto":
+            set_reasoning("auto", budget or None, fmt or None)
+        else:
+            plan["warnings"].append(f"Unsupported {family} thinking mode '{mode}'; using auto.")
+            plan["effective_mode"] = "auto"
+            set_reasoning("auto", budget or None, fmt or None)
+        return plan
+
+    if family == "deepseek-v31":
+        plan["warnings"].append("DeepSeek-V3.1 thinking/non-thinking depends on the GGUF chat template.")
+        if mode == "on":
+            set_reasoning("on", budget or None, fmt or "deepseek")
+        elif mode == "off":
+            set_reasoning("off", budget or "0", fmt or None)
+        elif mode == "auto":
+            set_reasoning("auto", budget or None, fmt or "deepseek")
+        else:
+            plan["warnings"].append(f"Unsupported DeepSeek-V3.1 mode '{mode}'; using auto.")
+            plan["effective_mode"] = "auto"
+            set_reasoning("auto", budget or None, fmt or "deepseek")
+        return plan
+
+    if family == "glm":
+        plan["warnings"].append("GLM thinking control is runtime/template-dependent for local GGUF builds.")
+        if mode in {"on", "off"}:
+            set_reasoning(mode, budget or None, fmt or None)
+        elif mode == "auto":
+            set_reasoning("auto", budget or None, fmt or None)
+        else:
+            plan["warnings"].append(f"Unsupported GLM mode '{mode}'; using auto.")
+            plan["effective_mode"] = "auto"
+            set_reasoning("auto", budget or None, fmt or None)
+        return plan
+
+    if family == "hermes4":
+        plan["warnings"].append("Hermes 4 thinking behavior depends on the GGUF chat template exposing a thinking variable.")
+        if mode == "on":
+            plan["chat_template_kwargs"] = {"thinking": True}
+            set_reasoning("on", budget or None, fmt or None)
+        elif mode == "off":
+            plan["chat_template_kwargs"] = {"thinking": False}
+            set_reasoning("off", budget or None, fmt or None)
+        elif mode == "auto":
+            set_reasoning("auto", budget or None, fmt or None)
+        else:
+            plan["warnings"].append(f"Unsupported Hermes 4 mode '{mode}'; using auto.")
+            plan["effective_mode"] = "auto"
+            set_reasoning("auto", budget or None, fmt or None)
+        return plan
+
+    if family == "gpt-oss":
+        if mode == "off":
+            plan["effective_mode"] = "low"
+            plan["chat_template_kwargs"] = {"reasoning_effort": "low"}
+            plan["warnings"].append("gpt-oss has no true off switch; using low reasoning effort.")
+        elif mode in {"low", "medium", "high"}:
+            plan["effective_mode"] = mode
+            plan["chat_template_kwargs"] = {"reasoning_effort": mode}
+        elif mode in {"", "auto"}:
+            plan["effective_mode"] = "default"
+        else:
+            plan["effective_mode"] = "default"
+            plan["warnings"].append(f"Unsupported gpt-oss mode '{mode}'; leaving reasoning effort at template default.")
+        return plan
+
+    if family == "reasoning-heavy":
+        plan["warnings"].append("This family is reasoning-heavy/reasoning-only; off mode is not reliable.")
+        if mode in {"on", "off", "auto"}:
+            set_reasoning(mode, budget or ("0" if mode == "off" else None), fmt or None)
+        else:
+            plan["warnings"].append(f"Unsupported reasoning-heavy mode '{mode}'; using auto.")
+            plan["effective_mode"] = "auto"
+            set_reasoning("auto", budget or None, fmt or None)
+        return plan
+
+    plan["warnings"].append("Unknown model family; applying only generic llama.cpp reasoning fields when available.")
+    if mode in {"on", "off", "auto"}:
+        set_reasoning(mode, budget or None, fmt or None)
+    return plan
+
+
+def _has_flag(help_text: str, flag: str) -> bool:
     return flag in (help_text or "")
 
 
-def _truthy(value):
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    v = str(value).strip().lower()
-    return v in {"1", "true", "yes", "y", "on", "enable", "enabled"}
+def _apply_manual_overrides(plan: dict[str, Any], *, manual_reasoning=None, manual_reasoning_budget=None, manual_reasoning_format=None):
+    if _is_filled(manual_reasoning):
+        plan["reasoning"] = str(manual_reasoning).strip()
+    if _is_filled(manual_reasoning_budget):
+        plan["reasoning_budget"] = str(manual_reasoning_budget).strip()
+    if _is_filled(manual_reasoning_format):
+        plan["reasoning_format"] = str(manual_reasoning_format).strip()
 
 
-def _clean_mode(mode):
-    return str(mode or "auto").strip().lower()
+def build_thinking_args(
+    config: dict | None,
+    *,
+    help_text: str,
+    model_path: str = "",
+    alias: str = "",
+    existing_chat_template_kwargs: dict[str, Any] | str | None = None,
+    manual_reasoning: str | None = None,
+    manual_reasoning_budget: str | None = None,
+    manual_reasoning_format: str | None = None,
+    manual_jinja: bool | None = None,
+):
+    """Return (args, summary_lines, warnings) for llama-server thinking config."""
+    plan = build_thinking_plan(config, model_path, alias)
+    warnings = list(plan.get("warnings") or [])
+    merged_kwargs = merge_chat_template_kwargs(
+        plan.get("chat_template_kwargs") or {},
+        existing_chat_template_kwargs,
+        warnings=warnings,
+    )
+    plan["chat_template_kwargs"] = merged_kwargs
+    _apply_manual_overrides(
+        plan,
+        manual_reasoning=manual_reasoning,
+        manual_reasoning_budget=manual_reasoning_budget,
+        manual_reasoning_format=manual_reasoning_format,
+    )
+    if manual_jinja is True:
+        plan["jinja"] = True
 
+    args: list[str] = []
+    supported = {
+        "jinja": _has_flag(help_text, "--jinja"),
+        "chat_template_kwargs": _has_flag(help_text, "--chat-template-kwargs"),
+        "reasoning": _has_flag(help_text, "--reasoning"),
+        "reasoning_budget": _has_flag(help_text, "--reasoning-budget"),
+        "reasoning_format": _has_flag(help_text, "--reasoning-format"),
+    }
 
-def detect_family(model_path: str = "", alias: str = "") -> str:
-    name = (str(model_path or "") + " " + str(alias or "")).lower()
-    name = name.replace("_", "-")
-    if "gemma-4" in name or "gemma4" in name:
-        return "gemma4"
-    if "qwen3" in name or "qwen-3" in name:
-        return "qwen3"
-    if "deepseek-v3.1" in name or "deepseek-v31" in name or "deepseek-3.1" in name:
-        return "deepseek-v31"
-    if "deepseek-r1" in name or "deepseek-r-1" in name:
-        return "deepseek-r1"
-    if "glm-4" in name or "glm4" in name or "glm-5" in name or "glm5" in name:
-        return "glm"
-    if "hermes-4" in name or "hermes4" in name:
-        return "hermes4"
-    if "gpt-oss" in name or "gptoss" in name:
-        return "gpt-oss"
-    if "qwq" in name:
-        return "qwq"
-    if "phi-4-reasoning" in name or "phi4-reasoning" in name:
-        return "phi-reasoning"
-    if "magistral" in name:
-        return "magistral"
-    return "unknown"
-
-
-def _merge_kwargs(existing: str | None, updates: dict) -> str:
-    data = {}
-    if existing:
-        try:
-            data = json.loads(existing)
-        except Exception:
-            # If user passes a non-JSON template kwargs string, do not corrupt it.
-            # Prefer the model-aware kwargs instead of concatenating invalid JSON.
-            data = {}
-    data.update(updates)
-    return json.dumps(data, separators=(",", ":"))
-
-
-def _add_reasoning_common(args, help_text, mode, budget="", fmt=""):
-    if mode in {"on", "off", "auto"} and has_flag(help_text, "--reasoning"):
-        args += ["--reasoning", mode]
-    if str(budget).strip() != "" and has_flag(help_text, "--reasoning-budget"):
-        args += ["--reasoning-budget", str(budget)]
-    if str(fmt).strip() != "" and has_flag(help_text, "--reasoning-format"):
-        args += ["--reasoning-format", str(fmt)]
-
-
-def build_thinking_args(config, *, help_text: str, model_path: str = "", alias: str = "", existing_chat_template_kwargs=None):
-    """Return (args, summary_lines, warnings) for model-aware thinking config.
-
-    config fields:
-      family: auto/gemma4/qwen3/deepseek-v31/glm/hermes4/gpt-oss/none
-      mode: on/off/auto or low/medium/high for gpt-oss
-      budget: -1/0/N or empty
-      format: none/deepseek/deepseek-legacy or empty
-      soft_prompt: optional user-facing hint, recorded in summary only
-    """
-    config = dict(config or {})
-    requested_family = str(config.get("family", "auto") or "auto").strip().lower()
-    detected = detect_family(model_path, alias)
-    family = detected if requested_family in {"", "auto"} else requested_family
-    mode = _clean_mode(config.get("mode", "auto"))
-    budget = str(config.get("budget", "") or "").strip()
-    fmt = str(config.get("format", "") or "").strip()
-    soft_prompt = str(config.get("soft_prompt", "") or "").strip()
-
-    args = []
-    warnings = []
-    kwargs = None
-
-    def add_jinja():
-        if has_flag(help_text, "--jinja") and "--jinja" not in args:
+    if plan.get("jinja"):
+        if supported["jinja"]:
             args.append("--jinja")
-
-    def add_kwargs(data):
-        nonlocal kwargs
-        kwargs = _merge_kwargs(existing_chat_template_kwargs, data)
-        if has_flag(help_text, "--chat-template-kwargs"):
-            args.extend(["--chat-template-kwargs", kwargs])
         else:
-            warnings.append("llama-server does not expose --chat-template-kwargs; template thinking may not change.")
+            warnings.append("llama-server does not expose --jinja; Jinja template controls were skipped.")
 
-    if family in {"none", "off"}:
-        summary = ["thinking family: none", "thinking mode: disabled by config"]
-        return args, summary, warnings
-
-    if family in {"gemma4", "qwen3"}:
-        add_jinja()
-        if mode == "on":
-            add_kwargs({"enable_thinking": True})
-            _add_reasoning_common(args, help_text, "on", budget or "-1", fmt)
-        elif mode == "off":
-            add_kwargs({"enable_thinking": False})
-            _add_reasoning_common(args, help_text, "off", budget or "0", fmt)
+    kwargs_json = ""
+    if merged_kwargs:
+        kwargs_json = _json_dumps(merged_kwargs)
+        if supported["chat_template_kwargs"]:
+            args += ["--chat-template-kwargs", kwargs_json]
         else:
-            _add_reasoning_common(args, help_text, "auto", budget, fmt)
-        summary = [
-            f"thinking family: {family}",
-            f"thinking mode: {mode}",
-            f"detected family: {detected}",
-            f"chat_template_kwargs: {kwargs or '-'}",
-            f"reasoning budget: {budget or ('-1' if mode == 'on' else '0' if mode == 'off' else '-')}",
-        ]
+            warnings.append("llama-server does not expose --chat-template-kwargs; template kwargs were skipped.")
 
-    elif family == "deepseek-v31":
-        add_jinja()
-        if mode == "on":
-            _add_reasoning_common(args, help_text, "on", budget or "-1", fmt or "deepseek")
-        elif mode == "off":
-            _add_reasoning_common(args, help_text, "off", budget or "0", fmt or "deepseek")
-            warnings.append("DeepSeek-V3.1 non-thinking is template-dependent; confirm the GGUF template supports it.")
+    reasoning = plan.get("reasoning")
+    if _is_filled(reasoning):
+        if supported["reasoning"]:
+            args += ["--reasoning", str(reasoning).strip()]
         else:
-            _add_reasoning_common(args, help_text, "auto", budget, fmt or "deepseek")
-        summary = [f"thinking family: {family}", f"thinking mode: {mode}", f"detected family: {detected}", "template: DeepSeek-V3.1 hybrid behavior depends on GGUF template"]
+            warnings.append("llama-server does not expose --reasoning; reasoning mode was skipped.")
 
-    elif family == "glm":
-        add_jinja()
-        if mode in {"on", "off"}:
-            add_kwargs({"thinking": {"type": "enabled" if mode == "on" else "disabled"}})
-            _add_reasoning_common(args, help_text, "on" if mode == "on" else "off", budget or ("-1" if mode == "on" else "0"), fmt)
+    budget = plan.get("reasoning_budget")
+    if _is_filled(budget):
+        if supported["reasoning_budget"]:
+            args += ["--reasoning-budget", str(budget).strip()]
         else:
-            _add_reasoning_common(args, help_text, "auto", budget, fmt)
-        warnings.append("GLM thinking control is runtime/template-dependent in local GGUF.")
-        summary = [f"thinking family: {family}", f"thinking mode: {mode}", f"detected family: {detected}", f"chat_template_kwargs: {kwargs or '-'}"]
+            warnings.append("llama-server does not expose --reasoning-budget; reasoning budget was skipped.")
 
-    elif family == "hermes4":
-        add_jinja()
-        if mode == "on":
-            add_kwargs({"thinking": True})
-            _add_reasoning_common(args, help_text, "on", budget or "-1", fmt)
-        elif mode == "off":
-            add_kwargs({"thinking": False})
-            _add_reasoning_common(args, help_text, "off", budget or "0", fmt)
+    fmt = plan.get("reasoning_format")
+    if _is_filled(fmt):
+        if supported["reasoning_format"]:
+            args += ["--reasoning-format", str(fmt).strip()]
         else:
-            _add_reasoning_common(args, help_text, "auto", budget, fmt)
-        warnings.append("Hermes 4 thinking depends on the GGUF chat template exposing a thinking variable.")
-        summary = [f"thinking family: {family}", f"thinking mode: {mode}", f"detected family: {detected}", f"chat_template_kwargs: {kwargs or '-'}"]
+            warnings.append("llama-server does not expose --reasoning-format; reasoning format was skipped.")
 
-    elif family == "gpt-oss":
-        effort = mode if mode in {"low", "medium", "high"} else "low" if mode == "off" else "medium"
-        if mode == "off":
-            warnings.append("gpt-oss has no reliable off switch; using low reasoning effort.")
-        if has_flag(help_text, "--reasoning-effort"):
-            args += ["--reasoning-effort", effort]
-        else:
-            warnings.append("llama-server build does not expose --reasoning-effort; use prompt/system controls if needed.")
-        summary = [f"thinking family: {family}", f"reasoning effort: {effort}", f"detected family: {detected}"]
-
-    elif family in {"deepseek-r1", "qwq", "phi-reasoning", "magistral"}:
-        warnings.append(f"{family} is treated as reasoning-heavy/reasoning-only; off toggle is not reliable.")
-        if mode == "off":
-            _add_reasoning_common(args, help_text, "off", budget or "0", fmt)
-        elif mode == "on":
-            _add_reasoning_common(args, help_text, "on", budget or "-1", fmt)
-        else:
-            _add_reasoning_common(args, help_text, "auto", budget, fmt)
-        summary = [f"thinking family: {family}", f"thinking mode: {mode}", f"detected family: {detected}", "warning: no reliable hard on/off switch"]
-
-    else:
-        warnings.append("Unknown model family; applying generic llama.cpp reasoning flags only.")
-        if mode in {"on", "off", "auto"}:
-            _add_reasoning_common(args, help_text, mode, budget, fmt)
-        summary = [f"thinking family: {family}", f"thinking mode: {mode}", f"detected family: {detected}", "mapper: generic"]
-
-    if soft_prompt:
-        summary.append(f"soft prompt hint: {soft_prompt}")
-    if args:
-        summary.append("thinking args: " + " ".join(args))
-    else:
-        summary.append("thinking args: -")
-    if warnings:
-        summary.extend(["warning: " + w for w in warnings])
+    summary = summarize_thinking_plan(plan, chat_template_kwargs_json=kwargs_json, warnings=warnings)
     return args, summary, warnings
 
 
-def summarize_thinking_config(config, *, model_path: str = "", alias: str = ""):
-    cfg = dict(config or {})
-    requested = str(cfg.get("family", "auto") or "auto").strip().lower()
-    detected = detect_family(model_path, alias)
-    family = detected if requested in {"", "auto"} else requested
-    mode = _clean_mode(cfg.get("mode", "auto"))
-    return [
-        f"thinking family: {family}",
-        f"thinking mode: {mode}",
-        f"detected family: {detected}",
+def summarize_thinking_plan(plan: dict[str, Any], *, chat_template_kwargs_json: str = "", warnings: list[str] | None = None) -> list[str]:
+    warnings = warnings if warnings is not None else list(plan.get("warnings") or [])
+    kwargs_json = chat_template_kwargs_json
+    if not kwargs_json and plan.get("chat_template_kwargs"):
+        kwargs_json = _json_dumps(plan["chat_template_kwargs"])
+    lines = [
+        f"family: {plan.get('family', '-')}",
+        f"detected family: {plan.get('detected_family', '-')}",
+        f"mode: {plan.get('effective_mode') or plan.get('mode') or '-'}",
+        f"chat_template_kwargs: {kwargs_json or '-'}",
+        f"reasoning: {plan.get('reasoning') or '-'}",
+        f"reasoning_budget: {plan.get('reasoning_budget') or '-'}",
+        f"reasoning_format: {plan.get('reasoning_format') or '-'}",
     ]
+    if plan.get("soft_prompt"):
+        lines.append(f"soft_prompt: {plan['soft_prompt']}")
+    if warnings:
+        lines.append("warnings: " + " | ".join(dict.fromkeys(warnings)))
+    else:
+        lines.append("warnings: -")
+    return lines
+
+
+def summarize_thinking_config(config, *, model_path: str = "", alias: str = ""):
+    plan = build_thinking_plan(config, model_path, alias)
+    return summarize_thinking_plan(plan)
