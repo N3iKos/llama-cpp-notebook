@@ -373,7 +373,7 @@ class NotebookPanel:
 
         # Shutdown button — prominent red styling.
         btn = widgets.Button(
-            description="⏻ Shutdown Server",
+            description="Shutdown Server",
             button_style="danger",
             icon="power-off",
             layout=widgets.Layout(
@@ -423,6 +423,7 @@ class NotebookPanel:
         def _on_click(_btn):
             _btn.disabled = True
             _btn.description = "⏳ Shutting down..."
+            _btn.icon = ""
             _btn.style.button_color = "#78716c"
             self.set_live_status("shutting down...", "#facc15")
             try:
@@ -445,6 +446,7 @@ class NotebookPanel:
         if self._shutdown_btn is not None:
             self._shutdown_btn.disabled = True
             self._shutdown_btn.description = "Shutdown Complete"
+            self._shutdown_btn.icon = "check"
             self._shutdown_btn.style.button_color = "#374151"
         self.set_live_status("server stopped", "#f87171")
         self.set_status("shutdown complete")
