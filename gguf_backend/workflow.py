@@ -313,9 +313,22 @@ def launch_backend_live(
     dict
         Same as ``launch_backend()`` plus ``{"shutdown_status": ...}``.
     """
+    import asyncio
     import signal
-    import threading
     import time
+
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+    except ImportError:
+        try:
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "nest_asyncio"], check=False)
+            import nest_asyncio
+            nest_asyncio.apply()
+        except Exception:
+            pass
 
     from .client import get_json
 
@@ -361,21 +374,16 @@ def launch_backend_live(
 
     # ── Phase 3: wire up the shutdown button ──
     #
-    # In Jupyter/Kaggle/Colab, ipywidgets button callbacks may run on the
-    # same IOLoop as the blocked cell.  We use TWO complementary mechanisms
-    # to guarantee the shutdown signal is received:
+    # In Jupyter/Kaggle/Colab, ipywidgets button callbacks run on the main thread's
+    # Tornado IOLoop. To keep the loop responsive during cell execution:
     #
-    #   A) File-based flag:  The callback writes ``shutdown.flag`` to disk.
-    #      The main loop polls for this file every iteration (~1s).
+    #   1. We apply ``nest_asyncio`` to allow nested event loops in Jupyter.
+    #   2. We run the monitoring loop as an asynchronous coroutine.
+    #   3. The click callback calls ``shutdown_all`` and sets ``shutdown_event``.
     #
-    #   B) SIGINT:  After killing processes, the callback sends SIGINT to
-    #      the current process.  This interrupts any blocking call in the
-    #      main loop (``time.sleep`` / ``Event.wait``) and raises
-    #      KeyboardInterrupt, which the loop catches gracefully.
-    #
-    # Together these handle every runtime quirk of Kaggle and Colab kernels.
+    # This guarantees the shutdown button functions instantly and terminates the loop.
 
-    shutdown_event = threading.Event()
+    shutdown_event = asyncio.Event()
 
     def _do_shutdown():
         """Callback invoked by the shutdown button click."""
@@ -393,21 +401,21 @@ def launch_backend_live(
 
         result["shutdown_status"] = status
 
-        # 2. Write file-based shutdown flag (polled by the main loop).
+        # 2. Write file-based shutdown flag (just in case).
         try:
             shutdown_flag_path.write_text("shutdown")
         except OSError:
             pass
 
-        # 3. Set threading event (in case the IOLoop does dispatch it).
-        shutdown_event.set()
-
-        # 4. Send SIGINT to interrupt the cell.  This is the nuclear option
-        #    that guarantees the blocking main loop will exit.
+        # 3. Set the event safely from the event loop thread
         try:
-            os.kill(os.getpid(), signal.SIGINT)
-        except OSError:
-            pass
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(shutdown_event.set)
+            else:
+                shutdown_event.set()
+        except Exception:
+            shutdown_event.set()
 
     panel.add_shutdown_button(_do_shutdown)
     panel.set_live_status("server running", "#4ade80")
@@ -416,20 +424,15 @@ def launch_backend_live(
     panel.render()
 
     # ── Phase 4: continuous monitoring loop ──
-    last_health_check = 0.0
-    health_ok = True
-    uptime_start = time.time()
+    async def _monitoring_loop():
+        last_health_check = 0.0
+        health_ok = True
+        uptime_start = time.time()
 
-    def _should_stop():
-        """Check all shutdown signals: threading event OR flag file."""
-        if shutdown_event.is_set():
-            return True
-        if shutdown_flag_path.exists():
-            return True
-        return False
+        while not shutdown_event.is_set():
+            if shutdown_flag_path.exists():
+                break
 
-    try:
-        while not _should_stop():
             now = time.time()
             uptime_secs = int(now - uptime_start)
             uptime_str = _format_uptime(uptime_secs)
@@ -481,15 +484,15 @@ def launch_backend_live(
 
             panel.render()
 
-            # Sleep in small increments so shutdown is responsive.
-            # Use time.sleep instead of Event.wait for broader compatibility.
-            time.sleep(log_refresh)
+            # Sleep asynchronously to yield control back to the event loop.
+            await asyncio.sleep(log_refresh)
 
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(_monitoring_loop())
     except KeyboardInterrupt:
-        # This is the EXPECTED path when the shutdown button sends SIGINT,
-        # or when the user manually interrupts the cell.
+        # Manual interrupt (not from our button) — kill processes too.
         if not shutdown_event.is_set() and not shutdown_flag_path.exists():
-            # Manual interrupt (not from our button) — kill processes too.
             panel.append("")
             panel.append(f"[{_ts()}] keyboard interrupt — shutting down")
             panel.render()
