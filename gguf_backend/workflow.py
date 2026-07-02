@@ -101,6 +101,7 @@ def download_assets(
     model_dir=None,
     hf_token: str = "",
     connections: int = 16,
+    downloader: str = "auto",
 ):
     root = _root(None)
     model_dir = model_dir or str(Path(root) / "models" / "current")
@@ -109,7 +110,7 @@ def download_assets(
     panel = NotebookPanel("Cell 2 — model / mmproj downloader", show_progress=True, height=390)
     panel.display_panel()
     panel.set_status("starting downloader")
-    panel.set_summary("download config", lines=[f"model_dir: {model_dir}", f"hf_token: {'set' if hf_token else 'empty'}", f"connections: {connections}"])
+    panel.set_summary("download config", lines=[f"model_dir: {model_dir}", f"hf_token: {'set' if hf_token else 'empty'}", f"connections: {connections}", f"downloader: {downloader}"])
 
     try:
         cfg = download_model_pair(
@@ -118,6 +119,7 @@ def download_assets(
             model_dir,
             hf_token=hf_token,
             connections=connections,
+            downloader=downloader,
             panel=panel,
         )
         panel.set_progress_visible(False)

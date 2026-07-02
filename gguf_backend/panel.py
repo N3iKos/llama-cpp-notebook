@@ -639,12 +639,17 @@ def run_command(
 
                 ready = []
                 if fd is not None:
-                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    try:
+                        ready, _, _ = select.select([fd], [], [], 0.1)
+                    except OSError:
+                        # Fallback untuk Windows karena select.select() tidak mendukung pipa non-socket
+                        time.sleep(0.1)
+                        ready = [fd]
 
                 if ready:
                     try:
                         raw = os.read(fd, 8192)
-                    except BlockingIOError:
+                    except (BlockingIOError, OSError):
                         raw = b""
                     if raw:
                         chunk = raw.decode("utf-8", errors="replace")
